@@ -753,20 +753,56 @@ try:
                     0 < parsed[i] < FLOATING_THRESHOLD for i in range(7)
                 ):
                     system_ready_left = True
-                    for i in range(7):
-                        if parsed[i] < FLOATING_THRESHOLD:
-                            ema_values_left[i] = float(parsed[i])
-                    print(">>> 왼팔 준비 완료")
+                for i in range(7):
+                    if parsed[i] < FLOATING_THRESHOLD:
+                        ema_values_left[i] = float(parsed[i])
+                        # [추가] prev_ticks도 같은 시점 값으로 초기화 → 첫 프레임 훅 이동 방지
+                        if i == 6:
+                            adc = int(ema_values_left[6])
+                            ratio = max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    (adc - GRIPPER_ADC_MIN_LEFT)
+                                    / (GRIPPER_ADC_MAX_LEFT - GRIPPER_ADC_MIN_LEFT),
+                                ),
+                            )
+                            prev_ticks_left[i] = int(
+                                GRIPPER_POS_CLOSE_LEFT
+                                + ratio
+                                * (GRIPPER_POS_OPEN_LEFT - GRIPPER_POS_CLOSE_LEFT)
+                            )
+                        else:
+                            init_tick = int(parsed[i])
+                            if i in REVERSE_CHANNELS_LEFT:
+                                init_tick = 4095 - init_tick
+                            prev_ticks_left[i] = init_tick
+                print(">>> 왼팔 준비 완료")
 
-            if not system_ready_right:
-                startup_count_right += 1
-                if startup_count_right >= STARTUP_WAIT_RIGHT and any(
-                    parsed[i + 7] > 0 for i in range(7)
-                ):
-                    system_ready_right = True
-                    for i in range(7):
-                        ema_values_right[i] = float(parsed[i + 7])
-                    print(">>> 오른팔 준비 완료")
+            system_ready_right = True
+            for i in range(7):
+                ema_values_right[i] = float(parsed[i + 7])
+                # [추가] prev_ticks도 같은 시점 값으로 초기화 → 첫 프레임 훅 이동 방지
+                if i == 6:
+                    adc = int(ema_values_right[6])
+                    ratio = max(
+                        0.0,
+                        min(
+                            1.0,
+                            (adc - GRIPPER_ADC_MIN_RIGHT)
+                            / (GRIPPER_ADC_MAX_RIGHT - GRIPPER_ADC_MIN_RIGHT),
+                        ),
+                    )
+                    prev_ticks_right[i] = int(
+                        GRIPPER_POS_CLOSE_RIGHT
+                        + ratio * (GRIPPER_POS_OPEN_RIGHT - GRIPPER_POS_CLOSE_RIGHT)
+                    )
+                else:
+                    init_tick = int(parsed[i + 7])
+                    if i in REVERSE_CHANNELS_RIGHT:
+                        init_tick = 4095 - init_tick
+                    prev_ticks_right[i] = init_tick
+                print(">>> 오른팔 준비 완료")
 
             time.sleep(0.02)
             continue
@@ -821,6 +857,22 @@ except KeyboardInterrupt:
 # 종료
 # =========================
 running = False
+
+# =========================
+# [추가] 종료 전 양팔을 안전 자세로 이동
+# =========================
+NEUTRAL_TICKS_LEFT = [1003, 1112, 2142, 976, 1858, 1939, 2034]  # 모터 1~7
+NEUTRAL_TICKS_RIGHT = [2983, 1044, 2020, 1017, 2102, 2088, 1966]  # 모터 9~15
+
+for i, m in enumerate(MOTORS_LEFT):
+    target = NEUTRAL_TICKS_LEFT[i]
+    packetHandler_left.write2ByteTxRx(portHandler_left, m, ADDR_GOAL_POSITION, target)
+
+for i, m in enumerate(MOTORS_RIGHT):
+    target = NEUTRAL_TICKS_RIGHT[i]
+    packetHandler_right.write2ByteTxRx(portHandler_right, m, ADDR_GOAL_POSITION, target)
+
+time.sleep(1.5)  # 양팔이 실제로 목표 위치까지 이동할 시간 확보
 
 for m in MOTORS_LEFT:
     packetHandler_left.write1ByteTxRx(

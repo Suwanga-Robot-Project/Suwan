@@ -364,11 +364,11 @@ TORQUE_DISABLE = 0
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
 REVERSE_CHANNELS_LEFT = [5]  # 모터 ID 6 반전
 
-EMA_ALPHA_ARM_LEFT = [0.4, 0.4, 0.4, 0.4, 0.4, 0.5]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.3, 0.4]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
-DEAD_ZONE_ENTER_LEFT = 15
-DEAD_ZONE_EXIT_LEFT = 25
+DEAD_ZONE_ENTER_LEFT = 28
+DEAD_ZONE_EXIT_LEFT = 40
 MAX_DELTA_LEFT = 70
 MAX_ACCEL_LEFT = 15  # [추가] 한 루프당 delta 변화량(가속도) 제한
 
@@ -381,6 +381,7 @@ ema_values_left = [None] * 7
 prev_ticks_left = [None] * 7
 prev_delta_left = [0] * 7  # [추가] 직전 루프의 실제 delta 기억 (가속도 계산용)
 in_dead_zone_left = [False] * 7
+dead_zone_anchor_left = [None] * 7  # [추가] 데드존 진입 시점 기준 위치
 current_state_left = STATE_IDLE
 prev_state_left = STATE_IDLE  # [추가] ERROR 진입 순간 판단용
 idle_confirm_count_left = 0
@@ -417,6 +418,7 @@ ema_values_right = [None] * 7
 prev_ticks_right = [None] * 7
 prev_delta_right = [0] * 7  # [추가]
 in_dead_zone_right = [False] * 7
+dead_zone_anchor_right = [None] * 7  # [추가] 데드존 진입 시점 기준 위치
 current_state_right = STATE_IDLE
 prev_state_right = STATE_IDLE  # [추가]
 idle_confirm_count_right = 0
@@ -444,6 +446,7 @@ def disable_left_torque():
 def process_left_arm(portHandler, packetHandler):
     global ema_values_left, prev_ticks_left, in_dead_zone_left
     global current_state_left, idle_confirm_count_left, prev_state_left
+    global dead_zone_anchor_left
 
     # 호출부 수정 2단계 이상값 탐지 구현
     if check_anomaly(parsed[0:7], prev_raw_left, anomaly_count_left, "왼팔"):
@@ -537,13 +540,18 @@ def process_left_arm(portHandler, packetHandler):
         if prev_ticks_left[i] is not None:
             diff = abs(tick - prev_ticks_left[i])
             if in_dead_zone_left[i]:
-                if diff <= DEAD_ZONE_EXIT_LEFT:
+                # [수정] 직전 프레임이 아니라 "고정된 기준점"과의 차이로 판정
+                diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
+                if diff_from_anchor <= DEAD_ZONE_EXIT_LEFT:
                     continue
                 else:
                     in_dead_zone_left[i] = False
             else:
                 if diff <= DEAD_ZONE_ENTER_LEFT:
                     in_dead_zone_left[i] = True
+                    dead_zone_anchor_left[i] = (
+                        tick  # [추가] 이 순간 위치를 기준점으로 고정
+                    )
                     continue
 
         packetHandler.write2ByteTxRx(portHandler, m, ADDR_GOAL_POSITION, tick)
@@ -568,6 +576,7 @@ def disable_right_torque():
 def process_right_arm(portHandler, packetHandler):
     global ema_values_right, prev_ticks_right, in_dead_zone_right
     global current_state_right, idle_confirm_count_right, prev_state_right
+    global dead_zone_anchor_right
 
     if check_anomaly(parsed[7:14], prev_raw_right, anomaly_count_right, "오른팔"):
         current_state_right = STATE_ERROR
@@ -654,13 +663,18 @@ def process_right_arm(portHandler, packetHandler):
 
             diff = abs(tick - prev_ticks_right[i])
             if in_dead_zone_right[i]:
-                if diff <= DEAD_ZONE_EXIT_RIGHT:
+                # [수정] 직전 프레임이 아니라 "고정된 기준점"과의 차이로 판정
+                diff_from_anchor = abs(tick - dead_zone_anchor_right[i])
+                if diff_from_anchor <= DEAD_ZONE_EXIT_RIGHT:
                     continue
                 else:
                     in_dead_zone_right[i] = False
             else:
                 if diff <= DEAD_ZONE_ENTER_RIGHT:
                     in_dead_zone_right[i] = True
+                    dead_zone_anchor_right[i] = (
+                        tick  # [추가] 이 순간 위치를 기준점으로 고정
+                    )
                     continue
 
         packetHandler.write2ByteTxRx(portHandler, m, ADDR_GOAL_POSITION, tick)

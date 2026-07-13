@@ -2,6 +2,7 @@ import serial
 import threading
 import time
 import struct  # CRC
+import socket  # [추가] UDP 통신용
 from scservo_sdk import *
 from pantilt_safe2 import update_pantilt
 from pantilt_safe2 import scs_write_pos
@@ -207,6 +208,15 @@ def check_anomaly(channel_parsed, prev_raw, anomaly_count, arm_name):
 # =========================
 PORT_ADC = "COM13"
 BAUD_ADC = 115200
+
+# =====================================================
+# [추가] 라즈베리파이 UDP 전송 설정
+# =====================================================
+RPI_IP = "192.168.0.24"
+RPI_PORT = 5005
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# =============================================
 
 adc_raw = [0] * 22
 parsed = [0] * 16  # [0:7]=왼팔, [7:14]=오른팔, [14:16]=IND, sw_toggle 별도
@@ -861,6 +871,24 @@ try:
             + f" L_STATE:{current_state_left}(prev:{prev_state_left}, cnt:{anomaly_count_left})"
             + f" R_STATE:{current_state_right}(prev:{prev_state_right}, cnt:{anomaly_count_right})"
         )
+
+        # =====================================================
+        # [추가] 라즈베리파이로 UDP 전송 (최종 서보 tick 값 기준)
+        # =====================================================
+        if all(t is not None for t in prev_ticks_left) and all(
+            t is not None for t in prev_ticks_right
+        ):
+            udp_data = (
+                "<"
+                + ",".join(str(t) for t in prev_ticks_left)
+                + ","
+                + ",".join(str(t) for t in prev_ticks_right)
+                + f",{pan_pos},{tilt_pos}>"
+            )
+            try:
+                udp_sock.sendto(udp_data.encode("utf-8"), (RPI_IP, RPI_PORT))
+            except Exception as e:
+                print("UDP 전송 오류:", e)
 
         time.sleep(0.02)
 

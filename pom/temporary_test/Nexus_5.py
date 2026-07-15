@@ -123,8 +123,8 @@ class SequenceValidator:
 # [추가] 실전 시퀀스 검증기 인스턴스 (Step2)
 # =====================================================
 PACKET_HEADER = b"\xaa\x55"
-PACKET_SIZE = 49
-PACKET_STRUCT = struct.Struct("<2sBH16H4HBBH")
+PACKET_SIZE = 51
+PACKET_STRUCT = struct.Struct("<2sBH16H5HBBH")
 
 seq_checker = SequenceValidator()
 
@@ -203,6 +203,39 @@ def check_anomaly(channel_parsed, prev_raw, anomaly_count, arm_name):
     return error_triggered
 
 
+# =====================================================
+# [추가] 상하이동(리프트) 3구간 상태 판정 — 히스테리시스 적용
+# =====================================================
+LIFT_LOW_ENTER = 1000
+LIFT_LOW_EXIT = 1200
+LIFT_HIGH_ENTER = 3000
+LIFT_HIGH_EXIT = 2800
+LIFT_REVERSED = False  # 실측 후 반전이면 True로
+
+lift_state = 0
+
+
+def update_lift_state(raw_adc):
+    global lift_state
+
+    if LIFT_REVERSED:
+        raw_adc = 4095 - raw_adc
+
+    if lift_state == 0:
+        if raw_adc < LIFT_LOW_ENTER:
+            lift_state = -1
+        elif raw_adc > LIFT_HIGH_ENTER:
+            lift_state = 1
+    elif lift_state == -1:
+        if raw_adc > LIFT_LOW_EXIT:
+            lift_state = 0
+    elif lift_state == 1:
+        if raw_adc < LIFT_HIGH_EXIT:
+            lift_state = 0
+
+    return lift_state
+
+
 # =========================
 # STM32 ADC 시리얼 (양팔 공용, 스레드 1개만 실행)
 # =========================
@@ -218,8 +251,8 @@ udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # =============================================
 
-adc_raw = [0] * 22
-parsed = [0] * 16  # [0:7]=왼팔, [7:14]=오른팔, [14:16]=IND, sw_toggle 별도
+adc_raw = [0] * 23
+parsed = [0] * 17  # [0:7]=왼팔, [7:14]=오른팔, [14:16]=조이스틱IND, [16]=상하이동
 
 sw_toggle = 0
 running = True
@@ -295,6 +328,7 @@ def read_serial_adc():
                     ind1,
                     ind2,
                     ind3,
+                    ind4,
                     sw0,
                     sw1,
                     crc_received,
@@ -338,8 +372,9 @@ def read_serial_adc():
                 adc_raw[17] = ind1
                 adc_raw[18] = ind2
                 adc_raw[19] = ind3
-                adc_raw[20] = sw0
-                adc_raw[21] = sw1
+                adc_raw[20] = ind4  # ← 상하이동 원시값, 새로 추가
+                adc_raw[21] = sw0
+                adc_raw[22] = sw1
 
                 for i in range(7):
                     parsed[i] = adc_raw[i + 1]
@@ -347,7 +382,8 @@ def read_serial_adc():
                     parsed[i + 7] = adc_raw[i + 9]
                 parsed[14] = adc_raw[16]
                 parsed[15] = adc_raw[17]
-                sw_toggle = adc_raw[20]
+                parsed[16] = adc_raw[20]  # ← 상하이동 원시값
+                sw_toggle = adc_raw[21]  # ← 20에서 21로 인덱스 이동
 
                 last_serial_rx_time = time.time()
 
@@ -773,6 +809,10 @@ try:
         if not (system_ready_left and system_ready_right):
             if not system_ready_left:
                 startup_count_left += 1
+                if startup_count_left % 50 == 0:  # 1초마다 한 번씩만 출력 (스팸 방지)
+                    print(
+                        f">>> [DEBUG] 왼팔 raw: {parsed[0:7]}  count={startup_count_left}"
+                    )
                 if startup_count_left >= STARTUP_WAIT_LEFT and any(
                     0 < parsed[i] < FLOATING_THRESHOLD for i in range(7)
                 ):
@@ -803,29 +843,29 @@ try:
                             prev_ticks_left[i] = init_tick
                 print(">>> 왼팔 준비 완료")
 
-            system_ready_right = True
-            for i in range(7):
-                ema_values_right[i] = float(parsed[i + 7])
-                # [추가] prev_ticks도 같은 시점 값으로 초기화 → 첫 프레임 훅 이동 방지
-                if i == 6:
-                    adc = int(ema_values_right[6])
-                    ratio = max(
-                        0.0,
-                        min(
-                            1.0,
-                            (adc - GRIPPER_ADC_MIN_RIGHT)
-                            / (GRIPPER_ADC_MAX_RIGHT - GRIPPER_ADC_MIN_RIGHT),
-                        ),
-                    )
-                    prev_ticks_right[i] = int(
-                        GRIPPER_POS_CLOSE_RIGHT
-                        + ratio * (GRIPPER_POS_OPEN_RIGHT - GRIPPER_POS_CLOSE_RIGHT)
-                    )
-                else:
-                    init_tick = int(parsed[i + 7])
-                    if i in REVERSE_CHANNELS_RIGHT:
-                        init_tick = 4095 - init_tick
-                    prev_ticks_right[i] = init_tick
+            if not system_ready_right:
+                for i in range(7):
+                    ema_values_right[i] = float(parsed[i + 7])
+                    if i == 6:
+                        adc = int(ema_values_right[6])
+                        ratio = max(
+                            0.0,
+                            min(
+                                1.0,
+                                (adc - GRIPPER_ADC_MIN_RIGHT)
+                                / (GRIPPER_ADC_MAX_RIGHT - GRIPPER_ADC_MIN_RIGHT),
+                            ),
+                        )
+                        prev_ticks_right[i] = int(
+                            GRIPPER_POS_CLOSE_RIGHT
+                            + ratio * (GRIPPER_POS_OPEN_RIGHT - GRIPPER_POS_CLOSE_RIGHT)
+                        )
+                    else:
+                        init_tick = int(parsed[i + 7])
+                        if i in REVERSE_CHANNELS_RIGHT:
+                            init_tick = 4095 - init_tick
+                        prev_ticks_right[i] = init_tick
+                system_ready_right = True
                 print(">>> 오른팔 준비 완료")
 
             time.sleep(0.02)
@@ -848,6 +888,7 @@ try:
         process_left_arm(portHandler_left, packetHandler_left)
         process_right_arm(portHandler_right, packetHandler_right)
 
+        lift_state = update_lift_state(parsed[16])  # ← 추가
         # =========================
         # 팬틸트 업데이트
         # =========================
@@ -868,6 +909,7 @@ try:
             + f" SW:{sw_toggle}"
             + f" PAN:{pan_pos:4d}"
             + f" TILT:{tilt_pos:4d}"
+            + f" LIFT:{lift_state:+d}(raw:{parsed[16]:4d})"  # ← 추가
             + f" L_STATE:{current_state_left}(prev:{prev_state_left}, cnt:{anomaly_count_left})"
             + f" R_STATE:{current_state_right}(prev:{prev_state_right}, cnt:{anomaly_count_right})"
         )
@@ -883,7 +925,7 @@ try:
                 + ",".join(str(t) for t in prev_ticks_left)
                 + ","
                 + ",".join(str(t) for t in prev_ticks_right)
-                + f",{pan_pos},{tilt_pos}>"
+                + f",{pan_pos},{tilt_pos},{lift_state}>"
             )
             try:
                 udp_sock.sendto(udp_data.encode("utf-8"), (RPI_IP, RPI_PORT))

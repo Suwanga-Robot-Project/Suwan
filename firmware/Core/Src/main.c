@@ -19,6 +19,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "dma.h"
+#include "iwdg.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -30,12 +32,24 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+#pragma pack(push, 1)   // 아래 구조체는 빈틈(패딩) 없이 꽉 채워서 저장하라는 지시
+typedef struct
+{
+    uint8_t  header[2];      // 0xAA 0x55
+    uint8_t  msg_type;       // 0x01 = ADC 데이터
+    uint16_t seq_num;
+    uint16_t mux_adc[16];
+    uint16_t adc_ind[5];
+    uint8_t  sw0_toggle;
+    uint8_t  sw1_toggle;
+    uint16_t crc;
+} AdcPacket_t;
+#pragma pack(pop)
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+static uint16_t Calc_CRC16(const uint8_t *data, uint16_t length); //CRC 계산 함수 추가
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,7 +61,7 @@
 
 /* USER CODE BEGIN PV */
 uint32_t mux_adc[16] = {0};
-uint32_t adc_ind[4] = {0};
+uint32_t adc_ind[5] = {0};
 uint8_t sw0 = 0;
 uint8_t sw1 = 0;
 char msg[256];
@@ -57,6 +71,12 @@ uint8_t sw1_toggle = 0;
 
 uint8_t sw0_prev = 1;
 uint8_t sw1_prev = 1;
+
+static uint16_t seq_counter = 0;
+static uint32_t crc_integrity_fail_count = 0;   // 자체검증 실패 누적 횟수
+static volatile uint16_t adc_ind_dma_buf[5];  //  DMA가 값을 채워줄 버퍼
+static volatile uint8_t adc_ind_dma_ready = 0; //  다 채워졌다는 신호
+static uint32_t adc_dma_error_count = 0;       //  DMA 에러 발생 횟수 (재시작용)
 
 /* USER CODE END PV */
 
@@ -80,13 +100,15 @@ void Read_MUX_ADC(uint8_t mux_ch, uint32_t *value)
 {
     ADC_ChannelConfTypeDef sConfig = {0};
 
-    // 1. MUX Channel selection
     MUX_Select(mux_ch);
 
-    // 2. time
     for (volatile int i = 0; i < 300; i++);
 
-    // 3. ADC == PA0 fix
+    //  mux 읽을 때는 ADC를 "1채널만 스캔"하도록 명시적으로 전환
+    hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.NbrOfConversion = 1;
+    HAL_ADC_Init(&hadc1);
+
     sConfig.Channel = ADC_CHANNEL_0;
     sConfig.Rank = 1;
     sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
@@ -94,7 +116,6 @@ void Read_MUX_ADC(uint8_t mux_ch, uint32_t *value)
 
     HAL_ADC_ConfigChannel(&hadc1, &sConfig);
 
-    // 4. ADC transmitter
     HAL_ADC_Start(&hadc1);
     HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
     *value = HAL_ADC_GetValue(&hadc1);
@@ -102,7 +123,7 @@ void Read_MUX_ADC(uint8_t mux_ch, uint32_t *value)
 }
 
 void Read_ADC_Channel(uint32_t channel, uint32_t *value)
-{
+{ //지워도 되고 남겨두됨!
     ADC_ChannelConfTypeDef sConfig = {0};
 
     sConfig.Channel = channel;
@@ -148,8 +169,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_USART2_UART_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOB,
        GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6,
@@ -167,11 +190,60 @@ int main(void)
 	         {
 	             Read_MUX_ADC(i, &mux_adc[i]);
 	         }
-	  Read_ADC_Channel(ADC_CHANNEL_9, &adc_ind[0]);   // PB1
-	  Read_ADC_Channel(ADC_CHANNEL_10, &adc_ind[1]);  // PC0
-	  Read_ADC_Channel(ADC_CHANNEL_11, &adc_ind[2]);   // PC1
-	  Read_ADC_Channel(ADC_CHANNEL_4, &adc_ind[3]); // PA4
 
+	  // mux 읽기(1채널 모드)에서 adc_ind 읽기(4채널 스캔+DMA 모드)로 전환
+	  hadc1.Init.ScanConvMode = ENABLE;
+	  hadc1.Init.NbrOfConversion = 5;
+	  HAL_ADC_Init(&hadc1);
+
+	  ADC_ChannelConfTypeDef sConfig_ind = {0};
+
+	  // 수정 — Rank 5 추가
+	  sConfig_ind.Channel = ADC_CHANNEL_4;
+	  sConfig_ind.Rank = 1;
+	  sConfig_ind.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig_ind);
+
+	  sConfig_ind.Channel = ADC_CHANNEL_9;
+	  sConfig_ind.Rank = 2;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig_ind);
+
+	  sConfig_ind.Channel = ADC_CHANNEL_10;
+	  sConfig_ind.Rank = 3;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig_ind);
+
+	  sConfig_ind.Channel = ADC_CHANNEL_11;
+	  sConfig_ind.Rank = 4;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig_ind);
+
+	  sConfig_ind.Channel = ADC_CHANNEL_5;   // ← 새로 추가 (PA5)
+	  sConfig_ind.Rank = 5;
+	  HAL_ADC_ConfigChannel(&hadc1, &sConfig_ind);
+
+	  	  // [수정] DMA로 4채널 한 번에 읽기
+		  adc_ind_dma_ready = 0;
+		  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_ind_dma_buf, 5);
+
+	  	  uint32_t dma_wait_start = HAL_GetTick();
+	  	  while (!adc_ind_dma_ready)
+	  	  {
+	  		  if (HAL_GetTick() - dma_wait_start > 10)
+	  	  	  {
+	  			  adc_dma_error_count++;
+	  	  	      break;
+	  	  	  }
+	  	  }
+
+	  	// Rank 순서(PA4, PB1, PC0, PC1)대로 채워진 걸 기존 배열 순서(PB1, PC0, PC1, PA4)에 맞게 옮김
+	  	  	  	  adc_ind[0] = adc_ind_dma_buf[1];  // PB1
+	  		  	  adc_ind[1] = adc_ind_dma_buf[2];  // PC0
+	  		  	  adc_ind[2] = adc_ind_dma_buf[3];  // PC1
+	  		  	  adc_ind[3] = adc_ind_dma_buf[0];  // PA4
+	  		  	  adc_ind[4] = adc_ind_dma_buf[4];  // PA5 (상하이동)  ← 새로 추가
+
+
+	  		  	  // DMA 완전히 종료 — 다음 루프의 mux 폴링 읽기가 DMA 잔여 상태에 영향받지 않도록
+	  		  	  HAL_ADC_Stop_DMA(&hadc1);
 
 
 	  sw0 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET);
@@ -193,26 +265,50 @@ int main(void)
 
 
 
-	  int len = sprintf(msg,
-	  "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u\r\n",
+	  AdcPacket_t tx_packet;
 
-	  mux_adc[0], mux_adc[1], mux_adc[2], mux_adc[3],
-	  mux_adc[4], mux_adc[5], mux_adc[6], mux_adc[7],
-	  mux_adc[8], mux_adc[9], mux_adc[10], mux_adc[11],
-	  mux_adc[12], mux_adc[13], mux_adc[14], mux_adc[15],
+	  tx_packet.header[0] = 0xAA;
+	  tx_packet.header[1] = 0x55;
+	  tx_packet.msg_type  = 0x01;
+	  tx_packet.seq_num   = seq_counter++;
 
-	  adc_ind[0], adc_ind[1], adc_ind[2], adc_ind[3],
+	  for (int i = 0; i < 16; i++)
+	  {
+		  tx_packet.mux_adc[i] = (uint16_t)mux_adc[i];
+	  }
+	  for (int i = 0; i < 5; i++)
+	  {
+		  tx_packet.adc_ind[i] = (uint16_t)adc_ind[i];
+	  }
+	  tx_packet.sw0_toggle = sw0_toggle;
+	  tx_packet.sw1_toggle = sw1_toggle;
 
-	  sw0_toggle, sw1_toggle);
+	  tx_packet.crc = Calc_CRC16((uint8_t*)&tx_packet, sizeof(AdcPacket_t) - sizeof(uint16_t));
 
-	  HAL_UART_Transmit(
-	      &huart2,
-	      (uint8_t*)msg,
-	      len,
-	      HAL_MAX_DELAY
-	  );
+	  // ===== 자체 검증: 방금 계산한 CRC가 지금 패킷 내용과 실제로 맞는지 재확인 =====
+	  uint16_t self_check_crc = Calc_CRC16((uint8_t*)&tx_packet, sizeof(AdcPacket_t) - sizeof(uint16_t));
+
+	  if (self_check_crc == tx_packet.crc)
+	  {
+		  // 검증 통과 → 정상 전송
+	  	  HAL_UART_Transmit(
+	  			  &huart2,
+	  	  	      (uint8_t*)&tx_packet,
+	  	  	      sizeof(AdcPacket_t),
+				  HAL_MAX_DELAY
+	  	  	  );
+	  }
+	  else
+	  {
+		  // 검증 실패 → 이번 패킷은 보내지 않고 건너뜀 (손상된 데이터를 내보내지 않음)
+	  	  crc_integrity_fail_count++;
+	  }
+	  // =============================================
+
 
 	  HAL_Delay(10);
+
+	  HAL_IWDG_Refresh(&hiwdg);   // ← 이 줄 새로 추가  IWDG
   }
   /* USER CODE END 3 */
 }
@@ -234,9 +330,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -259,7 +356,41 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+static uint16_t Calc_CRC16(const uint8_t *data, uint16_t length)
+{
+    uint16_t crc = 0xFFFF; //파이썬에서 만든 calc_crc16_ccitt()랑 완전히 똑같은 계산법
+    for (uint16_t i = 0; i < length; i++)
+    {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc = (crc << 1);
+        }
+    }
+    return crc;
+}
+//  DMA로 ADC 변환이 끝났을 때 자동으로 호출되는 함수
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1)
+    {
+        adc_ind_dma_ready = 1;   // 다 됐다는 신호만 켜줌
+    }
+}
 
+//  DMA 에러 발생 시 자동으로 호출되는 함수
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance == ADC1)
+    {
+        adc_dma_error_count++;
+        HAL_ADC_Stop_DMA(hadc);
+        HAL_ADC_Start_DMA(hadc, (uint32_t*)adc_ind_dma_buf, 5);  //  에러 시 재시작
+    }
+}
 /* USER CODE END 4 */
 
 /**

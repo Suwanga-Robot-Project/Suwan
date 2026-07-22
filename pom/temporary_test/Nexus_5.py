@@ -1,3 +1,4 @@
+import pantilt_safe2
 import serial
 import threading
 import time
@@ -416,7 +417,7 @@ TORQUE_DISABLE = 0
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
 REVERSE_CHANNELS_LEFT = [5]  # 모터 ID 6 반전
 
-EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.3, 0.4]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.7]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
 DEAD_ZONE_ENTER_LEFT = 28
@@ -451,13 +452,13 @@ MOTORS_RIGHT = [9, 10, 11, 12, 13, 14, 15]
 REVERSE_CHANNELS_RIGHT = [0, 3, 4, 5, 6]  # 9, 12, 13, 14, 15번 반전
 
 PAN_ID = 22
-TILT_ID = 21
+TILT_ID = 33
 
-EMA_ALPHA_ARM_RIGHT = [0.45, 0.45, 0.45, 0.45, 0.45, 0.5]
+EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.7]
 EMA_ALPHA_GRIPPER_RIGHT = 0.5
 
-DEAD_ZONE_ENTER_RIGHT = 12
-DEAD_ZONE_EXIT_RIGHT = 20
+DEAD_ZONE_ENTER_RIGHT = 28
+DEAD_ZONE_EXIT_RIGHT = 40
 MAX_DELTA_RIGHT = 70
 MAX_ACCEL_RIGHT = 15  # [추가]
 
@@ -778,7 +779,7 @@ packetHandler_right.write1ByteTxRx(
     portHandler_right, TILT_ID, ADDR_TORQUE_ENABLE, TORQUE_ENABLE
 )
 packetHandler_right.write1ByteTxRx(portHandler_right, PAN_ID, ADDR_ACCELERATION, 50)
-packetHandler_right.write1ByteTxRx(portHandler_right, TILT_ID, ADDR_ACCELERATION, 50)
+packetHandler_right.write1ByteTxRx(portHandler_right, TILT_ID, ADDR_ACCELERATION, 100)
 
 # =========================
 # 팬틸트 중앙 이동
@@ -847,7 +848,11 @@ try:
                             if i in REVERSE_CHANNELS_LEFT:
                                 init_tick = 4095 - init_tick
                             prev_ticks_left[i] = init_tick
-                print(">>> 왼팔 준비 완료")
+                # [수정] system_ready_left가 실제로 True가 된 순간에만 출력
+                # (기존엔 이 print가 조건 없이 매 루프 찍혀서, 대기 중에도
+                #  "왼팔 준비 완료"가 스팸처럼 반복 출력되는 버그가 있었음)
+                if system_ready_left:
+                    print(">>> 왼팔 준비 완료")
 
             if not system_ready_right:
                 for i in range(7):
@@ -913,8 +918,8 @@ try:
         print(
             f"L:{left_raw_str} | R:{right_raw_str}"
             + f" SW:{sw_toggle}"
-            + f" PAN:{pan_pos:4d}"
-            + f" TILT:{tilt_pos:4d}"
+            + f" PAN:{pantilt_safe2.pan_pos:4d}"
+            + f" TILT:{pantilt_safe2.tilt_pos:4d}"
             + f" LIFT:{lift_state:+d}(raw:{parsed[16]:4d})"  # ← 추가
             + f" L_STATE:{current_state_left}(prev:{prev_state_left}, cnt:{anomaly_count_left})"
             + f" R_STATE:{current_state_right}(prev:{prev_state_right}, cnt:{anomaly_count_right})"

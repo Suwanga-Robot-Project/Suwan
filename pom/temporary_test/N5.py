@@ -10,6 +10,9 @@ from pantilt_safe2 import scs_write_pos
 from pantilt_safe2 import pan_pos
 from pantilt_safe2 import tilt_pos
 
+# PC에서 라파 없이 알고리즘만 테스트할 때
+from whells_safeN import update_wheels
+
 # =====================================================
 # [공통] FSM 상태 정의
 # IDLE  : 해당 팔 전 채널 정지 상태, 모터 명령 안 보냄
@@ -124,8 +127,15 @@ class SequenceValidator:
 # [추가] 실전 시퀀스 검증기 인스턴스 (Step2)
 # =====================================================
 PACKET_HEADER = b"\xaa\x55"
-PACKET_SIZE = 51
-PACKET_STRUCT = struct.Struct("<2sBH16H5HBBH")
+PACKET_SIZE = 52
+PACKET_STRUCT = struct.Struct("<2sBH16H5HBBBH")  # sw1과 crc 사이에 B(key_states) 추가
+
+# [신규 추가] 키 상태 전역 변수 선언 (이렇게 해야 밖에서도 쓸 수 있음)
+key1_pressed = False
+key2_pressed = False
+key3_pressed = False
+key4_pressed = False
+key5_pressed = False
 
 seq_checker = SequenceValidator()
 
@@ -274,6 +284,7 @@ FLOATING_THRESHOLD = 4080
 # =====================================================
 SERIAL_TIMEOUT_SEC = 0.5  # 이 시간 이상 새 데이터 없으면 통신 두절로 판단
 last_serial_rx_time = time.time()
+first_packet_received = False  # ← 추가
 
 # =========================================
 # CRC 펌웨어 전환으로 바꾼 코드
@@ -282,7 +293,8 @@ last_serial_rx_time = time.time()
 
 def read_serial_adc():
     global adc_raw, parsed, sw_toggle, sw1_toggle, running, last_serial_rx_time
-
+    global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed
+    global first_packet_received  # ← 추가
     try:
         ser = serial.Serial(PORT_ADC, BAUD_ADC, timeout=1)
     except Exception as e:
@@ -313,7 +325,6 @@ def read_serial_adc():
                     break
 
                 raw_packet = bytes(buf[:PACKET_SIZE])
-
                 (
                     header,
                     msg_type,
@@ -341,6 +352,7 @@ def read_serial_adc():
                     ind4,
                     sw0,
                     sw1,
+                    key_states_raw,  # [신규 추가] 1바이트 키 상태 비트맵
                     crc_received,
                 ) = PACKET_STRUCT.unpack(raw_packet)
 
@@ -398,6 +410,13 @@ def read_serial_adc():
                 sw_toggle = adc_raw[21]  # ← 20에서 21로 인덱스 이동
                 sw1_toggle = adc_raw[22]  # ← 왼쪽 조이스틱 전용 스위치
 
+                key1_pressed = not bool(key_states_raw & (1 << 0))
+                key2_pressed = not bool(key_states_raw & (1 << 1))
+                key3_pressed = not bool(key_states_raw & (1 << 2))
+                key4_pressed = not bool(key_states_raw & (1 << 3))
+                key5_pressed = not bool(key_states_raw & (1 << 4))
+
+                first_packet_received = True  # ← 추가
                 last_serial_rx_time = time.time()
 
                 del buf[:PACKET_SIZE]
@@ -816,7 +835,10 @@ print("시작")
 try:
     while True:
         # ✅ 수정 1: 타임아웃 감지 로직을 루프 최상단으로 이동 (continue에 무시되지 않도록)
-        if time.time() - last_serial_rx_time > SERIAL_TIMEOUT_SEC:
+        if (
+            first_packet_received
+            and time.time() - last_serial_rx_time > SERIAL_TIMEOUT_SEC
+        ):
             if current_state_left != STATE_ERROR or current_state_right != STATE_ERROR:
                 print(
                     f">>> [통신오류] {SERIAL_TIMEOUT_SEC}초 이상 ADC 데이터 없음 — 양팔 ERROR 전환"
@@ -905,7 +927,10 @@ try:
         # =====================================================
         # [추가] 통신 타임아웃 감지 → 양팔 강제 ERROR
         # =====================================================
-        if time.time() - last_serial_rx_time > SERIAL_TIMEOUT_SEC:
+        if (
+            first_packet_received
+            and time.time() - last_serial_rx_time > SERIAL_TIMEOUT_SEC
+        ):
             if current_state_left != STATE_ERROR or current_state_right != STATE_ERROR:
                 print(
                     f">>> [통신오류] {SERIAL_TIMEOUT_SEC}초 이상 ADC 데이터 없음 — 양팔 ERROR 전환"
@@ -926,6 +951,7 @@ try:
         update_pantilt(
             parsed, sw_toggle, packetHandler_right, portHandler_right, PAN_ID, TILT_ID
         )
+        update_wheels(parsed, sw1_toggle)  # 7월 30일
 
         # =========================
         # 출력
@@ -936,14 +962,16 @@ try:
         right_raw_str = " ".join([f"{parsed[i+7]:5d}" for i in range(7)])
 
         print(
-            f"L:{left_raw_str} | R:{right_raw_str}"
-            + f" SW:{sw_toggle}"
-            + f" PAN:{pantilt_safe2.pan_pos:4d}"
-            + f" TILT:{pantilt_safe2.tilt_pos:4d}"
-            + f" LIFT:{lift_state:+d}(raw:{parsed[16]:4d})"  # ← 추가
-            + f" SW1:{sw1_toggle} LJOY: ind2={parsed[17]:4d} ind3={parsed[18]:4d}"
-            + f" L_STATE:{current_state_left}(prev:{prev_state_left}, cnt:{anomaly_count_left})"
-            + f" R_STATE:{current_state_right}(prev:{prev_state_right}, cnt:{anomaly_count_right})"
+            f"----------------------------------------------\n"
+            f"[팔]  L:{left_raw_str}\n"
+            f"      R:{right_raw_str}\n"
+            f"[상태] L_STATE:{current_state_left:5s}(prev:{prev_state_left:5s})  "
+            f"R_STATE:{current_state_right:5s}(prev:{prev_state_right:5s})\n"
+            f"[팬틸트] SW:{sw_toggle}  PAN:{pantilt_safe2.pan_pos:4d}  TILT:{pantilt_safe2.tilt_pos:4d}\n"
+            f"[상하이동] LIFT:{lift_state:+d} (raw:{parsed[16]:4d})\n"
+            f"[바퀴조이스틱] SW1:{sw1_toggle}  ind2:{parsed[17]:4d}  ind3:{parsed[18]:4d}\n"
+            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}]\n"
+            f"----------------------------------------------"
         )
 
         # =====================================================

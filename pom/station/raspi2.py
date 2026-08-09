@@ -743,6 +743,15 @@ def process_right_arm():
                     dead_zone_anchor_right[i] = tick
                     continue
 
+        # ===== 니퍼 착용 중일 때만 그리퍼(7번 모터) 조종 범위 제한 =====
+        # (2번 키로 니퍼 교체 후 원위치 복귀한 뒤 라이브 조종에 적용됨.
+        #  다른 그리퍼로 바뀌면 다음 프레임부터 자동으로 해제됨)
+        if i == 6 and GRIPPER_HELD_RIGHT == "nipper":
+            try:
+                tick = station_positions.clamp_for_nipper(tick)
+            except ValueError:
+                pass  # NIPPER_SAFE_TICK_RANGE 아직 미실측이면 clamp 없이 통과
+
         prev_ticks_right[i] = tick
 
 
@@ -756,7 +765,7 @@ prev_key_edge_states = (False, False, False, False, False)
 # ===== 타이밍 파라미터 =====
 NEUTRAL_TRANSITION_SECONDS = 2.0  # 정자세로 "천천히" 이동하는데 걸리는 시간
 NEUTRAL_TRANSITION_STEPS = 40  # 몇 단계로 나눠서 보간할지 (많을수록 부드러움)
-NEUTRAL_WAIT_SECONDS = 4.0  # 정자세에서 대기하는 시간 (흔들림 방지)
+NEUTRAL_WAIT_SECONDS = 2.0  # 정자세에서 대기하는 시간 (흔들림 방지)
 STATION_APPROACH_SECONDS = 2.0  # 스테이션 위치로 "천천히" 이동하는데 걸리는 시간
 STATION_APPROACH_STEPS = 40
 
@@ -847,8 +856,13 @@ def run_gripper_swap(arm_side, target_gripper):
     """
     global GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
+    other_side = "right" if arm_side == "left" else "left"
+
     held = GRIPPER_HELD_LEFT if arm_side == "left" else GRIPPER_HELD_RIGHT
     saved_ticks = list(prev_ticks_left if arm_side == "left" else prev_ticks_right)
+    other_saved_ticks = list(
+        prev_ticks_right if arm_side == "left" else prev_ticks_left
+    )
     neutral_ticks = (
         station_positions.NEUTRAL_TICKS_LEFT
         if arm_side == "left"
@@ -865,6 +879,18 @@ def run_gripper_swap(arm_side, target_gripper):
     )
     print(f"    → {NEUTRAL_WAIT_SECONDS}초 대기 (흔들림 방지)")
     time.sleep(NEUTRAL_WAIT_SECONDS)
+
+    # ===== 반대편 팔을 안전 자세로 파킹 (충돌 방지) =====
+    safe_ticks = station_positions.get_safe_retreat_ticks(other_side)
+    if safe_ticks is not None:
+        print(f"    → 반대편({other_side}) 팔을 안전 자세로 파킹")
+        move_arm_gradually(
+            other_side, safe_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
+        )
+    else:
+        print(
+            f"    [경고] {other_side} 안전자세(SAFE_RETREAT_MOTOR1) 미실측 — 파킹 건너뜀, 충돌 위험 있음"
+        )
 
     if held is None:
         # ===== 빈손: 목표 스테이션 위치로 이동(아직 위) → 하강 → 부착 =====
@@ -889,7 +915,8 @@ def run_gripper_swap(arm_side, target_gripper):
 
     else:
         # ===== 보유 중: 보유 스테이션 위치로 이동(아직 위) → 하강 → 탈거
-        #      → B안 클리어런스 → 목표 부착 =====
+        #      → (target_gripper가 있으면) B안 클리어런스 → 목표 부착
+        #      → (target_gripper가 None이면 = 5번 전체탈거) 탈거만 하고 끝 =====
         held_ticks = station_positions.get_station_ticks(arm_side, held)
         if held_ticks is None:
             raise ValueError(f"{arm_side}/{held} tick 값이 아직 실측되지 않았습니다")
@@ -906,27 +933,32 @@ def run_gripper_swap(arm_side, target_gripper):
             arm_side, held, held_ticks, move_arm_to
         )
 
-        clearance_seq = station_positions.get_direct_swap_clearance(
-            arm_side, held, target_gripper
-        )
-        if clearance_seq:
-            print(f"    → B안 클리어런스 순차이동")
-            arm_swap_sequence._move_sequential(
-                arm_side, after_detach_ticks, clearance_seq, move_arm_to
-            )
+        if target_gripper is None:
+            # ===== 5번(전체탈거): 새로 부착할 대상 없음 — 탈거만 하고 끝 =====
+            print(f"    → 전체탈거: 새 그리퍼 없이 빈손으로 완료")
+            new_held = None
         else:
-            print(f"    [경고] {held}->{target_gripper} 클리어런스 미실측 — 건너뜀")
-
-        target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
-        if target_ticks is None:
-            raise ValueError(
-                f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
+            clearance_seq = station_positions.get_direct_swap_clearance(
+                arm_side, held, target_gripper
             )
+            if clearance_seq:
+                print(f"    → B안 클리어런스 순차이동")
+                after_detach_ticks = arm_swap_sequence._move_sequential(
+                    arm_side, after_detach_ticks, clearance_seq, move_arm_to
+                )
+            else:
+                print(f"    [경고] {held}->{target_gripper} 클리어런스 미실측 — 건너뜀")
 
-        arm_swap_sequence._attach_at(
-            arm_side, target_gripper, target_ticks, move_arm_to
-        )
-        new_held = target_gripper
+            target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
+            if target_ticks is None:
+                raise ValueError(
+                    f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
+                )
+
+            arm_swap_sequence._attach_at(
+                arm_side, target_gripper, target_ticks, move_arm_to
+            )
+            new_held = target_gripper
 
     lift_backend.ascend_full(elapsed)
 
@@ -935,6 +967,16 @@ def run_gripper_swap(arm_side, target_gripper):
     move_arm_gradually(
         arm_side, saved_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
     )
+
+    # ===== 반대편 팔도 원래 위치로 복귀 =====
+    if safe_ticks is not None:
+        print(f"    → 반대편({other_side}) 팔도 원래 위치로 복귀")
+        move_arm_gradually(
+            other_side,
+            other_saved_ticks,
+            STATION_APPROACH_SECONDS,
+            STATION_APPROACH_STEPS,
+        )
 
     if arm_side == "left":
         GRIPPER_HELD_LEFT = new_held

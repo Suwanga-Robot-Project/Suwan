@@ -271,6 +271,9 @@ key2_pressed = False
 key3_pressed = False
 key4_pressed = False
 key5_pressed = False
+key7_pressed = (
+    False  # ← 신규 추가: 7번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
+)
 
 FLOATING_THRESHOLD = 4080
 
@@ -281,7 +284,7 @@ first_packet_received = False
 
 def read_serial_adc():
     global adc_raw, parsed, sw_toggle, sw1_toggle, running, last_serial_rx_time
-    global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed
+    global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed, key7_pressed
     global first_packet_received
 
     try:
@@ -459,6 +462,10 @@ def read_serial_adc():
                 key3_pressed = not bool(key_states & (1 << 2))
                 key4_pressed = not bool(key_states & (1 << 3))
                 key5_pressed = not bool(key_states & (1 << 4))
+                # 7번 키(신규 추가, 원래 6번인 줄 알았으나 실제로는 7번이었음)
+                # 1~5번과 달리 반전 버그 없이 정상 처리
+                # (main.c에서 bit=1이면 눌림 → 그대로 사용, not 안 붙임)
+                key7_pressed = bool(key_states & (1 << 6))
 
                 first_packet_received = True
                 last_serial_rx_time = time.time()
@@ -790,7 +797,7 @@ def move_arm_to(arm_side, ticks):
     ):
         return  # 아직 양팔 초기화 전이면 전송 스킵
 
-    key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}"
+    key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}"
     udp_data = (
         "<"
         + ",".join(str(t) for t in prev_ticks_left)
@@ -798,7 +805,8 @@ def move_arm_to(arm_side, ticks):
         + ",".join(str(t) for t in prev_ticks_right)
         + f",{pantilt_safe3.pan_pos},{pantilt_safe3.tilt_pos},{lift_state}"
         + f",{sw1_toggle},{parsed[17]},{parsed[18]}"
-        + f",{key_states_str}>"
+        + f",{key_states_str}"
+        + f",{sw_toggle}>"  # ← 신규: 오른쪽 노브(SW2, 팬/틸트용) 클릭 상태, 인덱스 21
     )
     try:
         udp_sock.sendto(udp_data.encode("utf-8"), (RPI_IP, RPI_PORT))
@@ -817,11 +825,26 @@ def _lerp_ticks(start_ticks, end_ticks, ratio):
     return result
 
 
+# ===== UDP 유실 대비 — 이동 끝난 뒤 최종값 재전송 =====
+FINAL_RESEND_COUNT = 4  # 몇 번 더 보낼지
+FINAL_RESEND_DELAY = 0.05  # 재전송 간격(초)
+
+
+def _resend_final(arm_side, final_ticks):
+    """
+    UDP는 도착 보장이 없어서, 특히 '마지막 목표값' 패킷이 유실되면
+    라파가 그 전 중간값에서 멈춰버릴 수 있음. 이동이 끝난 뒤 최종값을
+    몇 번 더 반복 전송해서, 적어도 하나는 도착하도록 함.
+    """
+    for _ in range(FINAL_RESEND_COUNT):
+        move_arm_to(arm_side, final_ticks)
+        time.sleep(FINAL_RESEND_DELAY)
+
+
 def move_arm_gradually(arm_side, target_ticks, duration_seconds, steps=40):
     """
-    현재 위치에서 target_ticks까지 여러 스텝으로 나눠서 "천천히" 이동.
-    (한 번에 goal position만 보내면 서보가 급하게 움직이므로, 중간 지점들을
-    순차적으로 보내서 부드러운 이동을 만듦)
+    (기존 방식, 지금은 안 씀 — 참고용으로 남겨둠)
+    현재 위치에서 target_ticks까지 7개 모터 전부 동시에 보간 이동.
     """
     current = list(prev_ticks_left if arm_side == "left" else prev_ticks_right)
     step_delay = duration_seconds / steps
@@ -830,6 +853,43 @@ def move_arm_gradually(arm_side, target_ticks, duration_seconds, steps=40):
         interp = _lerp_ticks(current, target_ticks, ratio)
         move_arm_to(arm_side, interp)
         time.sleep(step_delay)
+    _resend_final(arm_side, target_ticks)  # ← UDP 유실 대비 마무리 재전송
+
+
+# ===== 모터별 순차이동 파라미터 =====
+MOTOR_BY_MOTOR_DURATION = 0.3  # 모터 하나 이동에 걸리는 시간(초)
+MOTOR_BY_MOTOR_STEPS = 10  # 모터 하나 이동을 몇 단계로 나눌지
+
+
+def move_arm_motor_by_motor(
+    arm_side,
+    target_ticks,
+    duration_per_motor=MOTOR_BY_MOTOR_DURATION,
+    steps_per_motor=MOTOR_BY_MOTOR_STEPS,
+):
+    """
+    현재 위치에서 target_ticks까지, 모터를 1번부터 7번까지 순서대로 하나씩 이동.
+    (7개가 동시에 안 움직이고, 1번 모터가 목표에 다 도달한 뒤 2번 모터가 움직이기
+    시작하는 식 — 한 모터씩 딱딱 움직이는 걸 눈으로 확인하고 싶을 때 사용)
+    각 모터 자체의 이동은 보간으로 부드럽게 처리됨.
+    이미 목표와 같은 모터는 건너뜀(시간 낭비 방지).
+    """
+    working = list(prev_ticks_left if arm_side == "left" else prev_ticks_right)
+    for idx in range(len(working)):
+        if target_ticks[idx] is None or working[idx] is None:
+            continue
+        start_tick = working[idx]
+        target_tick = target_ticks[idx]
+        if start_tick == target_tick:
+            continue
+        step_delay = duration_per_motor / steps_per_motor
+        for step in range(1, steps_per_motor + 1):
+            ratio = step / steps_per_motor
+            working[idx] = int(round(start_tick + (target_tick - start_tick) * ratio))
+            move_arm_to(arm_side, working)
+            time.sleep(step_delay)
+        working[idx] = target_tick
+    _resend_final(arm_side, working)  # ← UDP 유실 대비 마무리 재전송 (전체 7개 최종값)
 
 
 def run_gripper_swap(arm_side, target_gripper):
@@ -842,17 +902,17 @@ def run_gripper_swap(arm_side, target_gripper):
     공통: 원래 위치 저장 → NEUTRAL로 천천히 이동 → 4초 대기(흔들림 방지)
 
     [빈손일 때]
-      → 목표 스테이션 위치로 천천히 이동(아직 위, 안 내려감)
-      → 하강(리미트스위치까지) → 부착(열린 상태로 접근→조이기)
-      → 상승 → 원래 위치로 복귀
+    → 목표 스테이션 위치로 천천히 이동(아직 위, 안 내려감)
+    → 하강(리미트스위치까지) → 부착(열린 상태로 접근→조이기)
+    → 상승 → 원래 위치로 복귀
 
     [이미 그리퍼를 들고 있을 때]
-      → 보유 중인 그리퍼의 스테이션 위치로 천천히 이동(아직 위)
-      → 하강 → 탈거(최대조임→최대개방)
-      → B안 클리어런스 순차이동(기존 실측값 그대로: 오른팔은 모터1→모터4,
+    → 보유 중인 그리퍼의 스테이션 위치로 천천히 이동(아직 위)
+    → 하강 → 탈거(최대조임→최대개방)
+    → B안 클리어런스 순차이동(기존 실측값 그대로: 오른팔은 모터1→모터4,
         왼팔은 모터4→모터1 순서로 살짝 든 채 옆 스테이션 방향으로 이동)
-      → 목표 스테이션 위치로 이동 → 부착
-      → 상승 → 원래 위치로 복귀
+    → 목표 스테이션 위치로 이동 → 부착
+    → 상승 → 원래 위치로 복귀
     """
     global GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
@@ -884,9 +944,7 @@ def run_gripper_swap(arm_side, target_gripper):
     safe_ticks = station_positions.get_safe_retreat_ticks(other_side)
     if safe_ticks is not None:
         print(f"    → 반대편({other_side}) 팔을 안전 자세로 파킹")
-        move_arm_gradually(
-            other_side, safe_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
-        )
+        move_arm_motor_by_motor(other_side, safe_ticks)
     else:
         print(
             f"    [경고] {other_side} 안전자세(SAFE_RETREAT_MOTOR1) 미실측 — 파킹 건너뜀, 충돌 위험 있음"
@@ -894,16 +952,16 @@ def run_gripper_swap(arm_side, target_gripper):
 
     if held is None:
         # ===== 빈손: 목표 스테이션 위치로 이동(아직 위) → 하강 → 부착 =====
-        target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
+        target_ticks = station_positions.get_corrected_station_ticks(
+            arm_side, target_gripper
+        )
         if target_ticks is None:
             raise ValueError(
                 f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
             )
 
         print(f"    → 목표({target_gripper}) 스테이션 위치로 천천히 이동 (아직 위)")
-        move_arm_gradually(
-            arm_side, target_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
-        )
+        move_arm_motor_by_motor(arm_side, target_ticks)
 
         elapsed = lift_backend.descend_until_bottom_switch()
         time.sleep(1.0)  # 흔들림 안정화
@@ -917,14 +975,12 @@ def run_gripper_swap(arm_side, target_gripper):
         # ===== 보유 중: 보유 스테이션 위치로 이동(아직 위) → 하강 → 탈거
         #      → (target_gripper가 있으면) B안 클리어런스 → 목표 부착
         #      → (target_gripper가 None이면 = 5번 전체탈거) 탈거만 하고 끝 =====
-        held_ticks = station_positions.get_station_ticks(arm_side, held)
+        held_ticks = station_positions.get_corrected_station_ticks(arm_side, held)
         if held_ticks is None:
             raise ValueError(f"{arm_side}/{held} tick 값이 아직 실측되지 않았습니다")
 
         print(f"    → 보유 중인({held}) 스테이션 위치로 천천히 이동 (아직 위)")
-        move_arm_gradually(
-            arm_side, held_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
-        )
+        move_arm_motor_by_motor(arm_side, held_ticks)
 
         elapsed = lift_backend.descend_until_bottom_switch()
         time.sleep(1.0)  # 흔들림 안정화
@@ -949,7 +1005,9 @@ def run_gripper_swap(arm_side, target_gripper):
             else:
                 print(f"    [경고] {held}->{target_gripper} 클리어런스 미실측 — 건너뜀")
 
-            target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
+            target_ticks = station_positions.get_corrected_station_ticks(
+                arm_side, target_gripper
+            )
             if target_ticks is None:
                 raise ValueError(
                     f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
@@ -962,21 +1020,21 @@ def run_gripper_swap(arm_side, target_gripper):
 
     lift_backend.ascend_full(elapsed)
 
-    # ===== 원래 위치로 복귀 =====
+    # ===== NEUTRAL을 경유해서 원래 위치로 복귀 =====
+    # (스테이션 위치 → 원래 위치로 바로 가면, 로봇 구조상 상하이동 레일과
+    #  겹치는 경로를 지나갈 수 있어서 엉킴/충돌 위험이 있음. 나갈 때(원래위치→
+    #  스테이션)는 NEUTRAL을 거치는데 돌아올 때만 안 거쳐서 생긴 비대칭 문제.
+    #  같은 안전 경로를 그대로 역순으로 써서 대칭을 맞춤.)
+    print(f"    → NEUTRAL 경유해서 복귀 (충돌 방지)")
+    move_arm_motor_by_motor(arm_side, neutral_ticks)
+
     print(f"    → 원래 위치로 천천히 복귀")
-    move_arm_gradually(
-        arm_side, saved_ticks, STATION_APPROACH_SECONDS, STATION_APPROACH_STEPS
-    )
+    move_arm_motor_by_motor(arm_side, saved_ticks)
 
     # ===== 반대편 팔도 원래 위치로 복귀 =====
     if safe_ticks is not None:
         print(f"    → 반대편({other_side}) 팔도 원래 위치로 복귀")
-        move_arm_gradually(
-            other_side,
-            other_saved_ticks,
-            STATION_APPROACH_SECONDS,
-            STATION_APPROACH_STEPS,
-        )
+        move_arm_motor_by_motor(other_side, other_saved_ticks)
 
     if arm_side == "left":
         GRIPPER_HELD_LEFT = new_held
@@ -992,9 +1050,9 @@ def check_gripper_swap_trigger():
     True를 반환하면 이번 루프에서 스왑이 실행됐다는 뜻 (호출부에서 continue 처리 필요).
 
     ⚠️ key1_pressed~key5_pressed는 현재 반전된 상태(안 눌렸을 때 True)로 남아있음
-       (요청에 따라 수정하지 않음). 그 결과 여기서의 엣지 감지는 "새로 눌린 순간"이
-       아니라 "누르고 있다가 손을 뗀 순간"에 반응하게 됩니다 — 실제 버튼을 누를 때가
-       아니라 뗄 때 교체가 시작될 수 있습니다.
+    (요청에 따라 수정하지 않음). 그 결과 여기서의 엣지 감지는 "새로 눌린 순간"이
+    아니라 "누르고 있다가 손을 뗀 순간"에 반응하게 됩니다 — 실제 버튼을 누를 때가
+    아니라 뗄 때 교체가 시작될 수 있습니다.
     """
     global prev_key_edge_states, GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
@@ -1089,29 +1147,36 @@ try:
                     print(">>> 왼팔 준비 완료")
 
             if not system_ready_right:
+                startup_count_right += 1
+                if startup_count_right >= STARTUP_WAIT_RIGHT and any(
+                    0 < parsed[i + 7] < FLOATING_THRESHOLD for i in range(7)
+                ):
+                    system_ready_right = True
                 for i in range(7):
-                    ema_values_right[i] = float(parsed[i + 7])
-                    if i == 6:
-                        adc = int(ema_values_right[6])
-                        ratio = max(
-                            0.0,
-                            min(
-                                1.0,
-                                (adc - GRIPPER_ADC_MIN_RIGHT)
-                                / (GRIPPER_ADC_MAX_RIGHT - GRIPPER_ADC_MIN_RIGHT),
-                            ),
-                        )
-                        prev_ticks_right[i] = int(
-                            GRIPPER_POS_CLOSE_RIGHT
-                            + ratio * (GRIPPER_POS_OPEN_RIGHT - GRIPPER_POS_CLOSE_RIGHT)
-                        )
-                    else:
-                        init_tick = int(parsed[i + 7])
-                        if i in REVERSE_CHANNELS_RIGHT:
-                            init_tick = 4095 - init_tick
-                        prev_ticks_right[i] = init_tick
-                system_ready_right = True
-                print(">>> 오른팔 준비 완료")
+                    if parsed[i + 7] < FLOATING_THRESHOLD:
+                        ema_values_right[i] = float(parsed[i + 7])
+                        if i == 6:
+                            adc = int(ema_values_right[6])
+                            ratio = max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    (adc - GRIPPER_ADC_MIN_RIGHT)
+                                    / (GRIPPER_ADC_MAX_RIGHT - GRIPPER_ADC_MIN_RIGHT),
+                                ),
+                            )
+                            prev_ticks_right[i] = int(
+                                GRIPPER_POS_CLOSE_RIGHT
+                                + ratio
+                                * (GRIPPER_POS_OPEN_RIGHT - GRIPPER_POS_CLOSE_RIGHT)
+                            )
+                        else:
+                            init_tick = int(parsed[i + 7])
+                            if i in REVERSE_CHANNELS_RIGHT:
+                                init_tick = 4095 - init_tick
+                            prev_ticks_right[i] = init_tick
+                if system_ready_right:
+                    print(">>> 오른팔 준비 완료")
 
             time.sleep(0.02)
             continue
@@ -1160,7 +1225,7 @@ try:
             f"[팬틸트] SW:{sw_toggle}  PAN:{pantilt_safe3.pan_pos:4d}  TILT:{pantilt_safe3.tilt_pos:4d}\n"
             f"[상하이동] LIFT:{lift_state:+d} (raw:{parsed[16]:4d})\n"
             f"[바퀴조이스틱] SW1:{sw1_toggle}  ind2:{parsed[17]:4d}  ind3:{parsed[18]:4d}\n"
-            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}]\n"
+            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}]\n"
             f"[그리퍼] LEFT:{GRIPPER_HELD_LEFT}  RIGHT:{GRIPPER_HELD_RIGHT}\n"
             f"----------------------------------------------"
         )
@@ -1172,7 +1237,7 @@ try:
         if all(t is not None for t in prev_ticks_left) and all(
             t is not None for t in prev_ticks_right
         ):
-            key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}"
+            key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}"
 
             udp_data = (
                 "<"
@@ -1181,7 +1246,8 @@ try:
                 + ",".join(str(t) for t in prev_ticks_right)
                 + f",{pan_pos},{tilt_pos},{lift_state}"
                 + f",{sw1_toggle},{parsed[17]},{parsed[18]}"
-                + f",{key_states_str}>"
+                + f",{key_states_str}"
+                + f",{sw_toggle}>"  # ← 신규: 오른쪽 노브(SW2, 팬/틸트용) 클릭 상태, 인덱스 21
             )
 
             try:

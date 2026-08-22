@@ -12,7 +12,9 @@ from pantilt_safe2 import tilt_pos
 
 # PC에서 라파 없이 알고리즘만 테스트할 때
 from whells_safeN import update_wheels
+from adc_filter import AdcFilter
 
+adc_filter = AdcFilter()
 # =====================================================
 # [공통] FSM 상태 정의
 # IDLE  : 해당 팔 전 채널 정지 상태, 모터 명령 안 보냄
@@ -387,6 +389,7 @@ def read_serial_adc():
                     mux14,
                     mux15,
                 ]
+                mux_adc_vals = adc_filter.apply(mux_adc_vals)
 
                 for i in range(16):
                     adc_raw[i] = mux_adc_vals[i]
@@ -425,6 +428,9 @@ def read_serial_adc():
             print("ERR:", e)
 
 
+# 이후 기존 EMA / 데드존 / tick 매핑은 그대로
+
+
 # =========================
 # 왼팔 STS3215 설정
 # =========================
@@ -442,11 +448,15 @@ TORQUE_DISABLE = 0
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
 REVERSE_CHANNELS_LEFT = [5]  # 모터 ID 6 반전
 
-EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.7]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.3]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
 DEAD_ZONE_ENTER_LEFT = 28
 DEAD_ZONE_EXIT_LEFT = 40
+# ▼ 추가: 채널별 데드존 예외 {인덱스: (ENTER, EXIT)}
+DEAD_ZONE_OVERRIDE_LEFT = {
+    5: (70, 110),  # 왼팔 6번 임시 대응
+}
 MAX_DELTA_LEFT = 70
 MAX_ACCEL_LEFT = 15  # [추가] 한 루프당 delta 변화량(가속도) 제한
 
@@ -615,17 +625,19 @@ def process_left_arm(portHandler, packetHandler):
                 else:
                     ema_values_left[i] = float(tick)
 
-        if prev_ticks_left[i] is not None:
-            diff = abs(tick - prev_ticks_left[i])
-            if in_dead_zone_left[i]:
-                # [수정] 직전 프레임이 아니라 "고정된 기준점"과의 차이로 판정
-                diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
-                if diff_from_anchor <= DEAD_ZONE_EXIT_LEFT:
+            if prev_ticks_left[i] is not None:
+                dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
+                    i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
+                )
+                diff = abs(tick - prev_ticks_left[i])
+                if in_dead_zone_left[i]:
+                    diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
+                if diff_from_anchor <= dz_exit:
                     continue
                 else:
                     in_dead_zone_left[i] = False
             else:
-                if diff <= DEAD_ZONE_ENTER_LEFT:
+                if diff <= dz_enter:
                     in_dead_zone_left[i] = True
                     dead_zone_anchor_left[i] = (
                         tick  # [추가] 이 순간 위치를 기준점으로 고정
@@ -826,7 +838,7 @@ crc16_self_test()
 sequence_validator_self_test()
 
 # ===========================
-
+adc_filter.reset()
 print("시작")
 
 # =========================
@@ -1037,5 +1049,6 @@ packetHandler_right.write1ByteTxRx(
 
 portHandler_left.closePort()
 portHandler_right.closePort()
+adc_filter.report()
 
 print("종료")

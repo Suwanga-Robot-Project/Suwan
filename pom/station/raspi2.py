@@ -11,6 +11,11 @@ import station_positions
 import arm_swap_sequence
 import key_input_handler
 
+# ===== ADC 노이즈 필터 (adc_filter.py가 같은 폴더에 있어야 함) =====
+from adc_filter import AdcFilter
+
+adc_filter = AdcFilter()
+
 # ===== 리프트(상하이동) 백엔드 — 라파의 lift_server.py에 원격 연결, 안 되면 가짜로 대체 =====
 try:
     import lift_control_remote as lift_backend
@@ -271,9 +276,10 @@ key2_pressed = False
 key3_pressed = False
 key4_pressed = False
 key5_pressed = False
-key7_pressed = (
-    False  # ← 신규 추가: 7번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
+key6_pressed = (
+    False  # ← 신규 추가: 6번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
 )
+key7_pressed = False  # 7번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
 
 FLOATING_THRESHOLD = 4080
 
@@ -284,7 +290,7 @@ first_packet_received = False
 
 def read_serial_adc():
     global adc_raw, parsed, sw_toggle, sw1_toggle, running, last_serial_rx_time
-    global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed, key7_pressed
+    global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed, key6_pressed, key7_pressed
     global first_packet_received
 
     try:
@@ -380,6 +386,7 @@ def read_serial_adc():
                     mux14,
                     mux15,
                 ]
+                mux_adc_vals = adc_filter.apply(mux_adc_vals)
 
                 for i in range(16):
                     adc_raw[i] = mux_adc_vals[i]
@@ -462,8 +469,9 @@ def read_serial_adc():
                 key3_pressed = not bool(key_states & (1 << 2))
                 key4_pressed = not bool(key_states & (1 << 3))
                 key5_pressed = not bool(key_states & (1 << 4))
-                # 7번 키(신규 추가, 원래 6번인 줄 알았으나 실제로는 7번이었음)
-                # 1~5번과 달리 반전 버그 없이 정상 처리
+                # 6번 키(신규 추가) — 1~5번과 달리 반전 버그 없이 정상 처리
+                key6_pressed = bool(key_states & (1 << 5))
+                # 7번 키 — 마찬가지로 정상 처리
                 # (main.c에서 bit=1이면 눌림 → 그대로 사용, not 안 붙임)
                 key7_pressed = bool(key_states & (1 << 6))
 
@@ -482,11 +490,15 @@ def read_serial_adc():
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
 REVERSE_CHANNELS_LEFT = [5]
 
-EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.7]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.3]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
 DEAD_ZONE_ENTER_LEFT = 28
 DEAD_ZONE_EXIT_LEFT = 40
+# ▼ 추가: 채널별 데드존 예외 {인덱스: (ENTER, EXIT)}
+DEAD_ZONE_OVERRIDE_LEFT = {
+    5: (70, 110),  # 왼팔 6번 임시 대응
+}
 MAX_DELTA_LEFT = 70
 MAX_ACCEL_LEFT = 15
 
@@ -517,7 +529,7 @@ REVERSE_CHANNELS_RIGHT = [0, 3, 4, 5, 6]
 PAN_ID = 22
 TILT_ID = 33
 
-EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.7]
+EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.3]
 EMA_ALPHA_GRIPPER_RIGHT = 0.5
 
 DEAD_ZONE_ENTER_RIGHT = 28
@@ -636,16 +648,19 @@ def process_left_arm():
                 else:
                     ema_values_left[i] = float(tick)
 
-        if prev_ticks_left[i] is not None:
-            diff = abs(tick - prev_ticks_left[i])
-            if in_dead_zone_left[i]:
-                diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
-                if diff_from_anchor <= DEAD_ZONE_EXIT_LEFT:
-                    continue
+            if prev_ticks_left[i] is not None:
+                dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
+                    i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
+                )
+                diff = abs(tick - prev_ticks_left[i])
+                if in_dead_zone_left[i]:
+                    diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
+                    if diff_from_anchor <= dz_exit:
+                        continue
                 else:
                     in_dead_zone_left[i] = False
             else:
-                if diff <= DEAD_ZONE_ENTER_LEFT:
+                if diff <= dz_enter:
                     in_dead_zone_left[i] = True
                     dead_zone_anchor_left[i] = tick
                     continue
@@ -797,7 +812,7 @@ def move_arm_to(arm_side, ticks):
     ):
         return  # 아직 양팔 초기화 전이면 전송 스킵
 
-    key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}"
+    key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key6_pressed)}{int(key7_pressed)}"
     udp_data = (
         "<"
         + ",".join(str(t) for t in prev_ticks_left)
@@ -902,17 +917,17 @@ def run_gripper_swap(arm_side, target_gripper):
     공통: 원래 위치 저장 → NEUTRAL로 천천히 이동 → 4초 대기(흔들림 방지)
 
     [빈손일 때]
-    → 목표 스테이션 위치로 천천히 이동(아직 위, 안 내려감)
-    → 하강(리미트스위치까지) → 부착(열린 상태로 접근→조이기)
-    → 상승 → 원래 위치로 복귀
+      → 목표 스테이션 위치로 천천히 이동(아직 위, 안 내려감)
+      → 하강(리미트스위치까지) → 부착(열린 상태로 접근→조이기)
+      → 상승 → 원래 위치로 복귀
 
     [이미 그리퍼를 들고 있을 때]
-    → 보유 중인 그리퍼의 스테이션 위치로 천천히 이동(아직 위)
-    → 하강 → 탈거(최대조임→최대개방)
-    → B안 클리어런스 순차이동(기존 실측값 그대로: 오른팔은 모터1→모터4,
+      → 보유 중인 그리퍼의 스테이션 위치로 천천히 이동(아직 위)
+      → 하강 → 탈거(최대조임→최대개방)
+      → B안 클리어런스 순차이동(기존 실측값 그대로: 오른팔은 모터1→모터4,
         왼팔은 모터4→모터1 순서로 살짝 든 채 옆 스테이션 방향으로 이동)
-    → 목표 스테이션 위치로 이동 → 부착
-    → 상승 → 원래 위치로 복귀
+      → 목표 스테이션 위치로 이동 → 부착
+      → 상승 → 원래 위치로 복귀
     """
     global GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
@@ -1050,9 +1065,9 @@ def check_gripper_swap_trigger():
     True를 반환하면 이번 루프에서 스왑이 실행됐다는 뜻 (호출부에서 continue 처리 필요).
 
     ⚠️ key1_pressed~key5_pressed는 현재 반전된 상태(안 눌렸을 때 True)로 남아있음
-    (요청에 따라 수정하지 않음). 그 결과 여기서의 엣지 감지는 "새로 눌린 순간"이
-    아니라 "누르고 있다가 손을 뗀 순간"에 반응하게 됩니다 — 실제 버튼을 누를 때가
-    아니라 뗄 때 교체가 시작될 수 있습니다.
+       (요청에 따라 수정하지 않음). 그 결과 여기서의 엣지 감지는 "새로 눌린 순간"이
+       아니라 "누르고 있다가 손을 뗀 순간"에 반응하게 됩니다 — 실제 버튼을 누를 때가
+       아니라 뗄 때 교체가 시작될 수 있습니다.
     """
     global prev_key_edge_states, GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
@@ -1101,6 +1116,7 @@ t.start()
 crc16_self_test()
 sequence_validator_self_test()
 
+adc_filter.reset()
 print("시작 — 서보는 라파에서 구동됨, 이 PC는 연산+UDP송신만 담당")
 
 # =========================
@@ -1225,7 +1241,7 @@ try:
             f"[팬틸트] SW:{sw_toggle}  PAN:{pantilt_safe3.pan_pos:4d}  TILT:{pantilt_safe3.tilt_pos:4d}\n"
             f"[상하이동] LIFT:{lift_state:+d} (raw:{parsed[16]:4d})\n"
             f"[바퀴조이스틱] SW1:{sw1_toggle}  ind2:{parsed[17]:4d}  ind3:{parsed[18]:4d}\n"
-            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}]\n"
+            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key6_pressed)}{int(key7_pressed)}]\n"
             f"[그리퍼] LEFT:{GRIPPER_HELD_LEFT}  RIGHT:{GRIPPER_HELD_RIGHT}\n"
             f"----------------------------------------------"
         )
@@ -1237,7 +1253,7 @@ try:
         if all(t is not None for t in prev_ticks_left) and all(
             t is not None for t in prev_ticks_right
         ):
-            key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key7_pressed)}"
+            key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key6_pressed)}{int(key7_pressed)}"
 
             udp_data = (
                 "<"
@@ -1286,4 +1302,5 @@ try:
 except Exception as e:
     print("종료 UDP 전송 오류:", e)
 
+adc_filter.report()
 print("종료")

@@ -15,7 +15,7 @@
   1. (리프트 하강 - FSM에서 처리, 그리퍼는 최대로 조인 상태 유지한 채 내려감)
   2. 현재 착용한 그리퍼의 스테이션 위치로 이동 (그리퍼 "최대로 조인 상태"로 꽂힘)
   3. 그리퍼 "벌리기" (탈거)
-  4. 팔만 수평 이동 (클리어런스 경유, 리프트는 그대로 유지) → 옆 스테이션 방향
+  4. 팔만 웨이포인트를 따라 이동 (클리어런스 경유, 리프트는 그대로 유지)
   5. 목표 스테이션 위치로 이동, 이때 그리퍼는 "열린 상태"로 접근
   6. 그리퍼 "조이기" (부착)
 
@@ -37,10 +37,22 @@ GRIPPER_MOTOR_INDEX = 6  # 7번째 모터(그리퍼) — 각 팔 tick 리스트�
 GRIPPER_SETTLE_SEC = 0.3  # 조임/펼침 사이 안정화 대기시간
 
 # ===== 보간 이동 기본값 =====
-GRADUAL_DURATION_SEC = (
-    0.6  # 그리퍼 조임/펼침, 클리어런스 한 스텝 등 "작은 동작" 이동 시간
-)
+GRADUAL_DURATION_SEC = 0.6  # 그리퍼 조임/펼침 등 "작은 동작" 이동 시간
 GRADUAL_STEPS = 15  # 몇 단계로 나눠서 보간할지
+
+# ===== 클리어런스(B안) 웨이포인트 전용 기본값 =====
+# 여러 축이 동시에 수백 tick씩 움직이므로 그리퍼 개폐보다 더 느리고 촘촘하게 간다.
+# 웨이포인트마다 개별로 덮어쓸 수 있음 (튜플 3번째 원소).
+CLEARANCE_DURATION_SEC = 1.2
+CLEARANCE_STEPS = 30
+
+# UDP는 도착 보장이 없어서, 하필 "마지막 목표값" 패킷이 유실되면 라파가 직전
+# 중간값에서 멈춰버린다. 클리어런스 마지막 웨이포인트는 곧바로 부착 동작으로
+# 이어지는 자세라 특히 치명적이므로 몇 번 더 반복 전송한다.
+# (raspi2.py의 _resend_final()과 같은 목적. move_arm_to_fn은 같은 값을 여러 번
+#  보내도 부작용이 없으므로 유선/시뮬 백엔드에서도 안전하다.)
+FINAL_RESEND_COUNT = 3
+FINAL_RESEND_DELAY = 0.05
 
 
 def _move_gradually(
@@ -104,14 +116,104 @@ def _detach_at(arm_side, gripper_name, station_ticks, move_arm_to_fn):
     return open_ticks
 
 
-def _move_sequential(arm_side, current_ticks, sequence, move_arm_to_fn):
+# =====================================================================
+# ===== 클리어런스(B안) 웨이포인트 이동 =====
+# =====================================================================
+
+
+def _resolve_waypoint(current_ticks, waypoint):
     """
-    클리어런스 등에서 쓰는 순차이동.
+    웨이포인트를 "실제로 보낼 7개짜리 tick 리스트"로 펼친다.
+
+    - waypoint 안의 None은 "이 모터는 건드리지 않음" → 직전 값 유지
+    - waypoint가 6개뿐이면 7번째(그리퍼)는 자동으로 직전 값 유지
+      → 클리어런스 도중 그리퍼는 탈거 직후의 MAX_OPEN 상태 그대로 유지됨
+
+    덕분에 "1번 모터만 움직임" 같은 스텝을
+        ([1760, None, None, None, None, None], 0.0)
+    처럼 한 줄로 쓸 수 있고, 나머지 값을 복사해 적을 필요가 없다.
+    """
+    resolved = list(current_ticks)
+    for i, value in enumerate(waypoint):
+        if i >= len(resolved):
+            break  # 7개를 넘는 값은 무시
+        if value is not None:
+            resolved[i] = value
+    return resolved
+
+
+def _unpack_waypoint_entry(entry):
+    """(waypoint,) / (waypoint, wait) / (waypoint, wait, duration) 전부 허용."""
+    waypoint = entry[0]
+    wait_after = entry[1] if len(entry) > 1 and entry[1] is not None else 0.0
+    duration = (
+        entry[2] if len(entry) > 2 and entry[2] is not None else CLEARANCE_DURATION_SEC
+    )
+    return waypoint, wait_after, duration
+
+
+def _move_waypoints(arm_side, current_ticks, waypoints, move_arm_to_fn):
+    """
+    클리어런스 웨이포인트 시퀀스를 순서대로 실행.
+
+    waypoints: [(웨이포인트, 대기초, 이동시간초), ...]
+      웨이포인트 = [모터1, ..., 모터6] 또는 [모터1, ..., 모터7]
+                   각 원소는 목표 tick 또는 None(그대로 유지)
+
+    각 웨이포인트까지 _move_gradually()로 보간 이동한 뒤 wait_after만큼 정지.
+    반환: 시퀀스가 끝난 뒤의 tick 리스트.
+    """
+    working_ticks = list(current_ticks)
+
+    for idx, entry in enumerate(waypoints, start=1):
+        waypoint, wait_after, duration = _unpack_waypoint_entry(entry)
+        target_ticks = _resolve_waypoint(working_ticks, waypoint)
+
+        if any(t is None for t in target_ticks):
+            print(
+                f"  [경고] 클리어런스 웨이포인트 {idx}에 미실측(None) 값이 남아 있습니다 — 건너뜀"
+            )
+            continue
+
+        moved = [
+            f"{i + 1}번:{b}"
+            for i, (a, b) in enumerate(zip(working_ticks, target_ticks))
+            if a != b
+        ]
+        if not moved:
+            print(f"  [클리어런스 {idx}/{len(waypoints)}] 변화 없음 — 건너뜀")
+            continue
+
+        print(
+            f"  [클리어런스 {idx}/{len(waypoints)}] {', '.join(moved)} "
+            f"({duration}초에 걸쳐 천천히)"
+        )
+        working_ticks = _move_gradually(
+            arm_side,
+            working_ticks,
+            target_ticks,
+            move_arm_to_fn,
+            duration=duration,
+            steps=CLEARANCE_STEPS,
+        )
+        if wait_after > 0:
+            print(f"    → 도달, {wait_after}초 대기")
+            time.sleep(wait_after)
+
+    # 마지막 자세 재전송 (UDP 유실 대비)
+    for _ in range(FINAL_RESEND_COUNT):
+        move_arm_to_fn(arm_side, working_ticks)
+        time.sleep(FINAL_RESEND_DELAY)
+
+    return working_ticks
+
+
+def _move_sequential_legacy(arm_side, current_ticks, sequence, move_arm_to_fn):
+    """
+    (구 형식) 한 번에 모터 하나씩만 움직이는 순차이동.
     sequence: [(모터_인덱스, 목표tick, 이번스텝후_대기초), ...]
-    current_ticks에서 시작해서, 한 스텝씩 해당 모터만 "천천히" 보간 이동시키고,
-    도달하면 측정해둔 wait_after만큼 정지.
-    (즉 4번 모터 먼저 천천히 움직이고 1초 대기 → 이어서 1번 모터만 천천히 움직이고 0.3초 대기, 식으로)
-    반환: 시퀀스 적용이 끝난 뒤의 tick 리스트.
+    새 코드에서는 웨이포인트 형식을 쓰지만, 예전 데이터가 남아 있어도
+    깨지지 않도록 남겨둠.
     """
     working_ticks = list(current_ticks)
     for motor_index, target_tick, wait_after in sequence:
@@ -132,10 +234,32 @@ def _move_sequential(arm_side, current_ticks, sequence, move_arm_to_fn):
     return working_ticks
 
 
+def _move_sequential(arm_side, current_ticks, sequence, move_arm_to_fn):
+    """
+    클리어런스 이동 진입점. 두 가지 형식을 자동 판별한다.
+
+    [신] 웨이포인트 형식: [([tick, tick, ...], 대기초), ...]
+         → 여러 축 동시 이동 + 단일 축 이동을 한 형식으로 표현
+    [구] 순차 형식:       [(모터_인덱스, 목표tick, 대기초), ...]
+
+    raspi2.py 등 호출부는 이 함수 이름/인자를 그대로 쓰면 되므로 수정 불필요.
+    """
+    if not sequence:
+        return list(current_ticks)
+
+    first_element = sequence[0][0]
+    if isinstance(first_element, (list, tuple)):
+        return _move_waypoints(arm_side, current_ticks, sequence, move_arm_to_fn)
+    return _move_sequential_legacy(arm_side, current_ticks, sequence, move_arm_to_fn)
+
+
 def _attach_at(arm_side, gripper_name, station_ticks, move_arm_to_fn):
     """
     target station_ticks 위치로 그리퍼를 "연 상태로 접근" → "조이기(부착)".
     반환: 부착 직후(조여진) tick 리스트.
+
+    ⚠️ 이 함수는 팔이 이미 station_ticks 자세에 도달해 있다고 가정한다.
+       (Flow B에서는 클리어런스 마지막 웨이포인트가 목표 스테이션 A값이므로 충족됨)
     """
     gripper_max_close = station_positions.get_gripper_max_close(arm_side, gripper_name)
     gripper_max_open = station_positions.get_gripper_max_open(arm_side, gripper_name)
@@ -199,7 +323,9 @@ def swap_gripper(arm_side, held_gripper, target_gripper, move_arm_to_fn):
             f"\n📍 [{arm_side} 팔] Flow B (짝 전환, 클리어런스): {held_gripper} → {target_gripper}"
         )
 
-        held_ticks = station_positions.get_station_ticks(arm_side, held_gripper)
+        held_ticks = station_positions.get_corrected_station_ticks(
+            arm_side, held_gripper
+        )
         if held_ticks is None:
             raise ValueError(
                 f"{arm_side}/{held_gripper} tick 값이 아직 실측되지 않았습니다"
@@ -210,13 +336,14 @@ def swap_gripper(arm_side, held_gripper, target_gripper, move_arm_to_fn):
             arm_side, held_gripper, held_ticks, move_arm_to_fn
         )
 
-        # 2) 팔만 순차적으로 수평 이동 (클리어런스, 리프트는 그대로) → 옆 스테이션 방향
-        #    예: 4번 모터 먼저 살짝 들고 1초 대기 → 1번 모터 회전
+        # 2) 웨이포인트를 따라 이동 (클리어런스, 리프트는 그대로)
+        #    마지막 웨이포인트는 get_direct_swap_clearance()가 목표 스테이션
+        #    A값으로 자동으로 붙여줌 → _attach_at 진입 시 점프가 생기지 않음
         clearance_sequence = station_positions.get_direct_swap_clearance(
             arm_side, held_gripper, target_gripper
         )
         if clearance_sequence:
-            print(f"  → 클리어런스 순차이동 시작")
+            print(f"  → 클리어런스 웨이포인트 이동 시작")
             _move_sequential(
                 arm_side, after_detach_ticks, clearance_sequence, move_arm_to_fn
             )
@@ -227,7 +354,9 @@ def swap_gripper(arm_side, held_gripper, target_gripper, move_arm_to_fn):
             )
 
         # 3) 목표 스테이션 위치로 (열린 상태로 접근) → 조이기 (부착)
-        target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
+        target_ticks = station_positions.get_corrected_station_ticks(
+            arm_side, target_gripper
+        )
         if target_ticks is None:
             raise ValueError(
                 f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
@@ -244,7 +373,9 @@ def swap_gripper(arm_side, held_gripper, target_gripper, move_arm_to_fn):
 
         if held_gripper is not None:
             # 이미 뭔가 들고 있으면 먼저 그 스테이션 위치에서 탈거
-            held_ticks = station_positions.get_station_ticks(arm_side, held_gripper)
+            held_ticks = station_positions.get_corrected_station_ticks(
+                arm_side, held_gripper
+            )
             if held_ticks is None:
                 raise ValueError(
                     f"{arm_side}/{held_gripper} tick 값이 아직 실측되지 않았습니다"
@@ -257,7 +388,9 @@ def swap_gripper(arm_side, held_gripper, target_gripper, move_arm_to_fn):
 
         if target_gripper is not None:
             # 목표 스테이션 위치로 (열린 상태로 접근) → 조이기 (부착)
-            target_ticks = station_positions.get_station_ticks(arm_side, target_gripper)
+            target_ticks = station_positions.get_corrected_station_ticks(
+                arm_side, target_gripper
+            )
             if target_ticks is None:
                 raise ValueError(
                     f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"

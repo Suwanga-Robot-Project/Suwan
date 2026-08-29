@@ -11,8 +11,12 @@ import station_positions
 import arm_swap_sequence
 import key_input_handler
 
+# ==================
+import jog_control as jc
+
 # ===== ADC 노이즈 필터 (adc_filter.py가 같은 폴더에 있어야 함) =====
 from adc_filter import AdcFilter
+from jog_control import JogController
 
 adc_filter = AdcFilter()
 
@@ -258,8 +262,8 @@ BAUD_ADC = 115200
 # =====================================================
 # 라즈베리파이 UDP 전송 설정
 # =====================================================
-RPI_IP = "192.168.0.24"
-RPI_PORT = 5005
+RPI_IP = "10.155.84.89"
+RPI_PORT = 5007
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 adc_raw = [0] * 24
@@ -280,6 +284,13 @@ key6_pressed = (
     False  # ← 신규 추가: 6번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
 )
 key7_pressed = False  # 7번 키캡 (정상 semantics: 눌리면 True, 안 눌리면 False)
+
+# ===== 조그(조이스틱 미세조작) =====
+jog_left = JogController("L")
+jog_right = JogController("R")
+jog_off_left = [0] * 7
+jog_off_right = [0] * 7
+last_jog_time = time.time()
 
 FLOATING_THRESHOLD = 4080
 
@@ -488,16 +499,17 @@ def read_serial_adc():
 # 왼팔 tick 계산 설정 (로컬 서보 없음 — UDP로 보낼 값만 계산)
 # =========================
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
-REVERSE_CHANNELS_LEFT = [5]
+REVERSE_CHANNELS_LEFT = []
 
-EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.3]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.3]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
 DEAD_ZONE_ENTER_LEFT = 28
 DEAD_ZONE_EXIT_LEFT = 40
-# ▼ 추가: 채널별 데드존 예외 {인덱스: (ENTER, EXIT)}
 DEAD_ZONE_OVERRIDE_LEFT = {
-    5: (70, 110),  # 왼팔 6번 임시 대응
+    # [비활성화] enter=70이 MAX_DELTA_LEFT(70)와 같아 항상 데드존에 진입하고,
+    #            exit=110은 MAX_DELTA 클램프 때문에 도달 불가 → 영구 잠금이었음
+    # 5: (70, 110),
 }
 MAX_DELTA_LEFT = 70
 MAX_ACCEL_LEFT = 15
@@ -505,7 +517,7 @@ MAX_ACCEL_LEFT = 15
 GRIPPER_ADC_MIN_LEFT = 145
 GRIPPER_ADC_MAX_LEFT = 1270
 GRIPPER_POS_OPEN_LEFT = 4100
-GRIPPER_POS_CLOSE_LEFT = 500
+GRIPPER_POS_CLOSE_LEFT = 300
 
 ema_values_left = [None] * 7
 prev_ticks_left = [None] * 7
@@ -524,12 +536,12 @@ STARTUP_WAIT_LEFT = 80
 # 오른팔 + 팬틸트 tick 계산 설정
 # =========================
 MOTORS_RIGHT = [9, 10, 11, 12, 13, 14, 15]
-REVERSE_CHANNELS_RIGHT = [0, 3, 4, 5, 6]
+REVERSE_CHANNELS_RIGHT = [0, 2, 3, 4, 5, 6]
 
 PAN_ID = 22
 TILT_ID = 33
 
-EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.3]
+EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.3]
 EMA_ALPHA_GRIPPER_RIGHT = 0.5
 
 DEAD_ZONE_ENTER_RIGHT = 28
@@ -539,8 +551,8 @@ MAX_ACCEL_RIGHT = 15
 
 GRIPPER_ADC_MIN_RIGHT = 2973
 GRIPPER_ADC_MAX_RIGHT = 3993
-GRIPPER_POS_OPEN_RIGHT = 3935
-GRIPPER_POS_CLOSE_RIGHT = 0
+GRIPPER_POS_OPEN_RIGHT = 4100
+GRIPPER_POS_CLOSE_RIGHT = 500
 
 ema_values_right = [None] * 7
 prev_ticks_right = [None] * 7
@@ -574,6 +586,7 @@ def process_left_arm():
             print(
                 ">>> ERROR: 왼팔 이상 감지 — tick 값 고정, 라파에 마지막 정상값만 계속 전송됨"
             )
+            jog_left.force_reset("에러")
         prev_state_left = current_state_left
         return
 
@@ -648,15 +661,15 @@ def process_left_arm():
                 else:
                     ema_values_left[i] = float(tick)
 
-            if prev_ticks_left[i] is not None:
-                dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
-                    i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
-                )
-                diff = abs(tick - prev_ticks_left[i])
-                if in_dead_zone_left[i]:
-                    diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
-                    if diff_from_anchor <= dz_exit:
-                        continue
+            dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
+                i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
+            )
+            diff = abs(tick - prev_ticks_left[i])
+
+            if in_dead_zone_left[i]:
+                diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
+                if diff_from_anchor <= dz_exit:
+                    continue
                 else:
                     in_dead_zone_left[i] = False
             else:
@@ -792,6 +805,21 @@ STATION_APPROACH_SECONDS = 2.0  # 스테이션 위치로 "천천히" 이동하�
 STATION_APPROACH_STEPS = 40
 
 
+def compose_send_ticks(base_ticks, jog_offset):
+    """
+    라파로 실제 보낼 값 = 1:1 매핑값 + 조그 오프셋.
+    base_ticks(prev_ticks_*)는 절대 건드리지 않는다 — 여기 오프셋이 섞이면
+    다음 프레임에 또 더해져서 팔이 한쪽으로 계속 흘러간다.
+    아직 초기화 안 된 값이 있으면 None을 반환한다.
+    """
+    out = []
+    for t, o in zip(base_ticks, jog_offset):
+        if t is None:
+            return None
+        out.append(max(0, min(4095, int(t) + int(o))))
+    return out
+
+
 def move_arm_to(arm_side, ticks):
     """
     그리퍼 자동교체 시퀀스가 각 단계마다 호출하는 함수.
@@ -907,6 +935,14 @@ def move_arm_motor_by_motor(
     _resend_final(arm_side, working)  # ← UDP 유실 대비 마무리 재전송 (전체 7개 최종값)
 
 
+def _with_gripper(ticks, gripper_tick):
+    """tick 리스트에서 7번(그리퍼)만 바꾼 새 리스트를 돌려준다."""
+    out = list(ticks)
+    if gripper_tick is not None and len(out) > 6:
+        out[6] = int(gripper_tick)
+    return out
+
+
 def run_gripper_swap(arm_side, target_gripper):
     """
     한 팔의 그리퍼 교체 전체 시퀀스 (블로킹 — 끝날 때까지 메인 루프가 멈춤).
@@ -931,6 +967,11 @@ def run_gripper_swap(arm_side, target_gripper):
     """
     global GRIPPER_HELD_LEFT, GRIPPER_HELD_RIGHT
 
+    # 교체 중엔 조그가 적용되면 안 된다. 오프셋이 남은 채로 시작하면
+    # move_arm_to()가 오프셋 없는 값을 보내면서 팔이 그만큼 툭 튄다.
+    jog_left.force_reset("그리퍼 교체")
+    jog_right.force_reset("그리퍼 교체")
+
     other_side = "right" if arm_side == "left" else "left"
 
     held = GRIPPER_HELD_LEFT if arm_side == "left" else GRIPPER_HELD_RIGHT
@@ -947,10 +988,30 @@ def run_gripper_swap(arm_side, target_gripper):
     print(f"\n>>> [{arm_side} 팔] 그리퍼교체 시작: {held} → {target_gripper}")
     print(f"    (원래 위치 저장: {saved_ticks})")
 
+    # 툴을 들고 있으면 최대 조임을 끝까지 유지한 채 내려간다.
+    # 빈손이면 툴 자루가 조 사이로 들어가야 하므로 최대 개방으로 접근한다.
+    if held is not None:
+        carry_tick = station_positions.get_gripper_max_close(arm_side, held)
+        print(f"    → 이동 중 그리퍼: 최대 조임 {carry_tick}")
+    elif target_gripper is not None:
+        carry_tick = station_positions.get_gripper_max_open(arm_side, target_gripper)
+        print(f"    → 이동 중 그리퍼: 최대 개방 {carry_tick}")
+    else:
+        carry_tick = None
+
+    # 팔이 움직이기 전에 그리퍼부터 조인다.
+    # move_arm_motor_by_motor()는 1→7 순서라 그리퍼가 맨 나중이다.
+    # 그대로 두면 툴을 헐겁게 문 채로 팔이 먼저 움직인다.
+    if carry_tick is not None:
+        move_arm_gradually(arm_side, _with_gripper(saved_ticks, carry_tick), 1.0, 20)
+
     # ===== 공통: NEUTRAL로 천천히 이동 → 4초 대기 =====
     print(f"    → NEUTRAL(정자세)로 천천히 이동")
     move_arm_gradually(
-        arm_side, neutral_ticks, NEUTRAL_TRANSITION_SECONDS, NEUTRAL_TRANSITION_STEPS
+        arm_side,
+        _with_gripper(neutral_ticks, carry_tick),
+        NEUTRAL_TRANSITION_SECONDS,
+        NEUTRAL_TRANSITION_STEPS,
     )
     print(f"    → {NEUTRAL_WAIT_SECONDS}초 대기 (흔들림 방지)")
     time.sleep(NEUTRAL_WAIT_SECONDS)
@@ -976,13 +1037,16 @@ def run_gripper_swap(arm_side, target_gripper):
             )
 
         print(f"    → 목표({target_gripper}) 스테이션 위치로 천천히 이동 (아직 위)")
-        move_arm_motor_by_motor(arm_side, target_ticks)
+        move_arm_motor_by_motor(arm_side, _with_gripper(target_ticks, carry_tick))
 
         elapsed = lift_backend.descend_until_bottom_switch()
-        time.sleep(1.0)  # 흔들림 안정화
+        time.sleep(1.0)
 
         arm_swap_sequence._attach_at(
-            arm_side, target_gripper, target_ticks, move_arm_to
+            arm_side,
+            target_gripper,
+            _with_gripper(target_ticks, carry_tick),
+            move_arm_to,
         )
         new_held = target_gripper
 
@@ -994,14 +1058,14 @@ def run_gripper_swap(arm_side, target_gripper):
         if held_ticks is None:
             raise ValueError(f"{arm_side}/{held} tick 값이 아직 실측되지 않았습니다")
 
-        print(f"    → 보유 중인({held}) 스테이션 위치로 천천히 이동 (아직 위)")
-        move_arm_motor_by_motor(arm_side, held_ticks)
+        print(f"    → 보유 중인({held}) 스테이션 위치로 이동 (최대 조임 유지)")
+        move_arm_motor_by_motor(arm_side, _with_gripper(held_ticks, carry_tick))
 
         elapsed = lift_backend.descend_until_bottom_switch()
-        time.sleep(1.0)  # 흔들림 안정화
+        time.sleep(1.0)
 
         after_detach_ticks = arm_swap_sequence._detach_at(
-            arm_side, held, held_ticks, move_arm_to
+            arm_side, held, _with_gripper(held_ticks, carry_tick), move_arm_to
         )
 
         if target_gripper is None:
@@ -1028,8 +1092,14 @@ def run_gripper_swap(arm_side, target_gripper):
                     f"{arm_side}/{target_gripper} tick 값이 아직 실측되지 않았습니다"
                 )
 
+            target_open = station_positions.get_gripper_max_open(
+                arm_side, target_gripper
+            )
             arm_swap_sequence._attach_at(
-                arm_side, target_gripper, target_ticks, move_arm_to
+                arm_side,
+                target_gripper,
+                _with_gripper(target_ticks, target_open),
+                move_arm_to,
             )
             new_held = target_gripper
 
@@ -1040,11 +1110,17 @@ def run_gripper_swap(arm_side, target_gripper):
     #  겹치는 경로를 지나갈 수 있어서 엉킴/충돌 위험이 있음. 나갈 때(원래위치→
     #  스테이션)는 NEUTRAL을 거치는데 돌아올 때만 안 거쳐서 생긴 비대칭 문제.
     #  같은 안전 경로를 그대로 역순으로 써서 대칭을 맞춤.)
+    return_tick = (
+        station_positions.get_gripper_max_close(arm_side, new_held)
+        if new_held is not None
+        else None
+    )
+
     print(f"    → NEUTRAL 경유해서 복귀 (충돌 방지)")
-    move_arm_motor_by_motor(arm_side, neutral_ticks)
+    move_arm_motor_by_motor(arm_side, _with_gripper(neutral_ticks, return_tick))
 
     print(f"    → 원래 위치로 천천히 복귀")
-    move_arm_motor_by_motor(arm_side, saved_ticks)
+    move_arm_motor_by_motor(arm_side, _with_gripper(saved_ticks, return_tick))
 
     # ===== 반대편 팔도 원래 위치로 복귀 =====
     if safe_ticks is not None:
@@ -1124,6 +1200,17 @@ print("시작 — 서보는 라파에서 구동됨, 이 PC는 연산+UDP송신�
 # =========================
 try:
     while True:
+
+        if (
+            first_packet_received
+            and time.time() - last_serial_rx_time > SERIAL_TIMEOUT_SEC
+        ):
+            if current_state_left != STATE_ERROR or current_state_right != STATE_ERROR:
+                print(
+                    f">>> [통신오류] {SERIAL_TIMEOUT_SEC}초 이상 ADC 데이터 없음 — 양팔 ERROR 전환"
+                )
+            current_state_left = STATE_ERROR
+            current_state_right = STATE_ERROR
 
         if not (system_ready_left and system_ready_right):
             if not system_ready_left:
@@ -1216,6 +1303,47 @@ try:
             time.sleep(0.02)
             continue
 
+        # ===== 조그 오프셋 계산 =====
+        _now = time.time()
+        dt = _now - last_jog_time
+        last_jog_time = _now
+
+        jog_off_left = jog_left.update(
+            gate_toggle=sw1_toggle,  # 왼팔 조이스틱 = 바퀴 게이트
+            key7=key7_pressed,
+            joy_x=adc_raw[18],  # ind2 원시값 (parsed[17] 아님!)
+            joy_y=adc_raw[19],  # ind3 원시값 (parsed[18] 아님!)
+            gripper_closed=jc.is_gripper_closed(
+                prev_ticks_left[6], GRIPPER_POS_OPEN_LEFT, GRIPPER_POS_CLOSE_LEFT
+            ),
+            dt=dt,
+        )
+        jog_off_right = jog_right.update(
+            gate_toggle=sw_toggle,  # 오른팔 조이스틱 = 팬틸트 게이트
+            key7=key7_pressed,
+            joy_x=parsed[14],  # ind0
+            joy_y=parsed[15],  # ind1
+            gripper_closed=(
+                prev_ticks_right[6] is not None
+                and prev_ticks_right[6] < GRIPPER_POS_OPEN_RIGHT - 300
+            ),
+            dt=dt,
+        )
+
+        # 그리퍼를 완전히 열면 = 물체를 놓았다는 뜻 → 오프셋 자동 초기화
+        if (
+            prev_ticks_left[6] is not None
+            and prev_ticks_left[6] > GRIPPER_POS_OPEN_LEFT - 100
+        ):
+            if not jog_left.is_offset_zero():
+                jog_left.force_reset("그리퍼 개방")
+        if (
+            prev_ticks_right[6] is not None
+            and prev_ticks_right[6] > GRIPPER_POS_OPEN_RIGHT - 100
+        ):
+            if not jog_right.is_offset_zero():
+                jog_right.force_reset("그리퍼 개방")
+
         process_left_arm()
         process_right_arm()
 
@@ -1243,6 +1371,8 @@ try:
             f"[바퀴조이스틱] SW1:{sw1_toggle}  ind2:{parsed[17]:4d}  ind3:{parsed[18]:4d}\n"
             f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key6_pressed)}{int(key7_pressed)}]\n"
             f"[그리퍼] LEFT:{GRIPPER_HELD_LEFT}  RIGHT:{GRIPPER_HELD_RIGHT}\n"
+            f"[조그] L:{jog_left.status_text()}\n"
+            f"       R:{jog_right.status_text()}\n"
             f"----------------------------------------------"
         )
 
@@ -1250,20 +1380,21 @@ try:
         # 라즈베리파이로 UDP 전송 — 라파 servo_receiver.py가
         # 기대하는 포맷 그대로: <L1~7,R9~15,Pan,Tilt,Lift> (17개 값)
         # =====================================================
-        if all(t is not None for t in prev_ticks_left) and all(
-            t is not None for t in prev_ticks_right
-        ):
+        send_left = compose_send_ticks(prev_ticks_left, jog_off_left)
+        send_right = compose_send_ticks(prev_ticks_right, jog_off_right)
+
+        if send_left is not None and send_right is not None:
             key_states_str = f"{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}{int(key6_pressed)}{int(key7_pressed)}"
 
             udp_data = (
                 "<"
-                + ",".join(str(t) for t in prev_ticks_left)
+                + ",".join(str(t) for t in send_left)
                 + ","
-                + ",".join(str(t) for t in prev_ticks_right)
+                + ",".join(str(t) for t in send_right)
                 + f",{pan_pos},{tilt_pos},{lift_state}"
                 + f",{sw1_toggle},{parsed[17]},{parsed[18]}"
                 + f",{key_states_str}"
-                + f",{sw_toggle}>"  # ← 신규: 오른쪽 노브(SW2, 팬/틸트용) 클릭 상태, 인덱스 21
+                + f",{sw_toggle}>"
             )
 
             try:
@@ -1286,6 +1417,9 @@ NEUTRAL_TICKS_RIGHT = [2983, 1044, 2020, 1017, 2102, 2088, 1966]
 NEUTRAL_PAN = 511
 NEUTRAL_TILT = 511
 NEUTRAL_LIFT = 0
+
+jog_left.force_reset("종료")
+jog_right.force_reset("종료")
 
 shutdown_data = (
     "<"

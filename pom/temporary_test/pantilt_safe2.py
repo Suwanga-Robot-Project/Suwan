@@ -59,7 +59,7 @@ def update_pantilt(adc, sw, scs_packet, portHandler, PAN_ID, TILT_ID):
     global ema_ind0
     global ema_ind1
 
-    print(f"DEBUG - adc[14]:{adc[14]} adc[15]:{adc[15]} sw:{sw}")
+    # print(f"DEBUG - adc[14]:{adc[14]} adc[15]:{adc[15]} sw:{sw}")
 
     # =========================
     # SW OFF

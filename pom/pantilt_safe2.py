@@ -20,35 +20,17 @@ ema_ind0 = None
 ema_ind1 = None
 
 
-def scs_write_pos(
-    scs_packet,
-    portHandler,
-    servo_id,
-    pos
-):
+def scs_write_pos(scs_packet, portHandler, servo_id, pos):
 
     pos = SCS_TOSCS(pos, 0)
 
     pos_L = SCS_LOBYTE(pos)
     pos_H = SCS_HIBYTE(pos)
 
-    scs_packet.writeTxRx(
-        portHandler,
-        servo_id,
-        42,
-        2,
-        [pos_H, pos_L]
-    )
+    scs_packet.writeTxRx(portHandler, servo_id, 42, 2, [pos_H, pos_L])
 
 
-def update_pantilt(
-    adc,
-    sw,
-    scs_packet,
-    portHandler,
-    PAN_ID,
-    TILT_ID
-):
+def update_pantilt(adc, sw, scs_packet, portHandler, PAN_ID, TILT_ID):
 
     global pan_pos
     global tilt_pos
@@ -96,17 +78,17 @@ def update_pantilt(
     # 최소 1, 최대 8 (너무 빠르면 제어 어려워서 제한)
     # =====================================================
     def calc_step(val):
-        deviation = abs(val - center) - deadzone   # deadzone 제거한 순수 이탈량
+        deviation = abs(val - center) - deadzone  # deadzone 제거한 순수 이탈량
         if deviation <= 0:
             return 0
-        step = int(deviation / 1900 * 8)           # 최대 이탈(1900) 기준 최대 8
-        return max(1, min(8, step))                # 1~8 클램핑
+        step = int(deviation / 1900 * 8)  # 최대 이탈(1900) 기준 최대 8
+        return max(1, min(8, step))  # 1~8 클램핑
 
     # =========================
     # PAN (IND0)
     # =========================
     if ind0 > center + deadzone:
-        pan_pos -= calc_step(ind0) 
+        pan_pos -= calc_step(ind0)
     elif ind0 < center - deadzone:
         pan_pos += calc_step(ind0)
 

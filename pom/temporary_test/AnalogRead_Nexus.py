@@ -1,5 +1,6 @@
 import serial
 import threading
+import struct
 import time
 
 # =====================================================
@@ -79,9 +80,6 @@ class SequenceValidator:
             result = "REORDER"
             self.reorder_count += 1
 
-        # [수정] 실제로 전진한 경우(OK, LOST)에만 last_seq 갱신.
-        # DUPLICATE/REORDER는 "이미 지나간 옛 패킷이 늦게 도착한 것"이라
-        # 최신 위치 기준점을 되돌리면 안 됨 (그러면 다음 패킷까지 오판됨)
         if result in ("OK", "LOST"):
             self.last_seq = seq
 
@@ -110,25 +108,16 @@ def sequence_validator_self_test():
 
 
 def check_anomaly(channel_parsed, prev_raw, anomaly_count, arm_name):
-    """
-    Stage 1: 절대범위(0~4095) 이탈 → 즉시 이상 판정
-    Stage 2: 변화율 급변 또는 극단값 "왕복"(단선 패턴) → 채널별 연속 카운트,
-            ANOMALY_CONFIRM_COUNT(3회) 연속되면 True(ERROR) 리턴
-    [수정] 극단값 안에서의 미세한 흔들림(정상 가동범위 끝)은 오탐 방지를 위해 제외.
-    LOW↔HIGH 사이를 실제로 왕복하는 경우만 단선 패턴으로 판정.
-    """
     error_triggered = False
 
     for i in range(7):
         raw = channel_parsed[i]
 
-        # ---------- Stage 1: 절대범위 검증 ----------
         if raw < ADC_MIN_VALID or raw > ADC_MAX_VALID:
             print(f">>> [Stage1] {arm_name} 채널{i} 범위 이탈 raw={raw}")
             error_triggered = True
             continue
 
-        # ---------- Stage 2: 변화율 + 단선 패턴(왕복) 검증 ----------
         is_anomaly_frame = False
 
         if prev_raw[i] is not None:
@@ -137,8 +126,6 @@ def check_anomaly(channel_parsed, prev_raw, anomaly_count, arm_name):
             if delta > MAX_RAW_DELTA:
                 is_anomaly_frame = True
 
-            # [수정] "극단값 안에서 미세하게 다름"이 아니라
-            # "LOW 쪽에 있다가 HIGH 쪽으로, 또는 그 반대로 튀는지"만 판정
             prev_near_low = prev_raw[i] <= EXTREME_LOW
             curr_near_low = raw <= EXTREME_LOW
             prev_near_high = prev_raw[i] >= EXTREME_HIGH
@@ -162,16 +149,57 @@ def check_anomaly(channel_parsed, prev_raw, anomaly_count, arm_name):
     return error_triggered
 
 
+# =====================================================
+# [추가] 상하이동(리프트) 3구간 상태 판정 — 히스테리시스 적용
+# 실측 기반 캘리브레이션:
+#   - 전체 가동범위: 507(하강 끝) ~ 2483(상승 끝)
+#   - 중립(가만히 둔 상태) 실측값: 1949~1977, 평균 1963
+#   - 산술적 중앙값(1495)과 실제 중립값(1963)이 어긋나서
+#     비율 계산 대신 중립 실측값 기준으로 임계값을 직접 잡음
+#   - 히스테리시스 여유는 실제 테스트로 미세조정한 값
+# =====================================================
+LIFT_LOW_ENTER = 1400  # 중립(1963)에서 -563
+LIFT_LOW_EXIT = 1600  # 중립(1963)에서 -363
+LIFT_HIGH_ENTER = 2200  # 중립(1963)에서 +237
+LIFT_HIGH_EXIT = 2000  # 중립(1963)에서 +37
+LIFT_REVERSED = False  # 실측 후 반전이면 True로
+
+lift_state = 0
+
+
+def update_lift_state(raw_adc):
+    global lift_state
+
+    if LIFT_REVERSED:
+        raw_adc = 4095 - raw_adc
+
+    if lift_state == 0:
+        if raw_adc < LIFT_LOW_ENTER:
+            lift_state = -1
+        elif raw_adc > LIFT_HIGH_ENTER:
+            lift_state = 1
+    elif lift_state == -1:
+        if raw_adc > LIFT_LOW_EXIT:
+            lift_state = 0
+    elif lift_state == 1:
+        if raw_adc < LIFT_HIGH_EXIT:
+            lift_state = 0
+
+    return lift_state
+
+
 # =========================
 # STM32 ADC 시리얼
 # =========================
 PORT_ADC = "COM13"
 BAUD_ADC = 115200
 
-adc_raw = [0] * 22
-parsed = [0] * 16
+parsed = [
+    0
+] * 17  # parsed[0:7]=왼팔, parsed[7:14]=오른팔, parsed[14]=VRx, parsed[15]=VRy, parsed[16]=상하이동
 
 sw_toggle = 0
+sw1_toggle_val = 0
 running = True
 
 FLOATING_THRESHOLD = 4080
@@ -179,9 +207,23 @@ FLOATING_THRESHOLD = 4080
 SERIAL_TIMEOUT_SEC = 0.5
 last_serial_rx_time = time.time()
 
+# AdcPacket_t: header(2s)+msg_type(B)+seq_num(H)+mux_adc(16H)+adc_ind(5H)+sw0(B)+sw1(B)+crc(H)
+PACKET_FORMAT = "<2sBH16H5HBBBH"  # H 앞에 B(key_states) 1개 추가
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)  # 자동으로 52바이트로 계산됨
+
+seq_validator_adc = SequenceValidator()
+
+
+# [신규 추가] 1~5번 키캡 상태 전역 변수 선언 (Unused 회색 음영 방지)
+key1_pressed = False
+key2_pressed = False
+key3_pressed = False
+key4_pressed = False
+key5_pressed = False
+
 
 def read_serial_adc():
-    global adc_raw, parsed, sw_toggle, running, last_serial_rx_time
+    global parsed, sw_toggle, sw1_toggle_val, running, last_serial_rx_time
 
     try:
         ser = serial.Serial(PORT_ADC, BAUD_ADC, timeout=1)
@@ -189,36 +231,70 @@ def read_serial_adc():
         print("시리얼 열기 실패:", e)
         return
 
+    buf = bytearray()
+
     while running:
         try:
-            line = ser.readline().decode(errors="ignore")
-            line = line.replace("\x00", "").strip()
-
-            if not line:
+            data = ser.read(ser.in_waiting or 1)
+            if not data:
                 continue
+            buf.extend(data)
 
-            parts = line.split(",")
+            while len(buf) >= PACKET_SIZE:
+                idx = buf.find(b"\xaa\x55")
+                if idx == -1:
+                    buf.clear()
+                    break
+                if idx > 0:
+                    del buf[:idx]
+                if len(buf) < PACKET_SIZE:
+                    break
 
-            if len(parts) < 22:
-                continue
+                packet_bytes = bytes(buf[:PACKET_SIZE])
+                del buf[:PACKET_SIZE]
 
-            for i in range(min(22, len(parts))):
-                val_str = "".join(filter(str.isdigit, parts[i]))
-                if val_str != "":
-                    adc_raw[i] = int(val_str)
+                unpacked = struct.unpack(PACKET_FORMAT, packet_bytes)
+                seq_num = unpacked[2]
+                mux_adc = unpacked[3:19]  # 16개
+                adc_ind = unpacked[19:24]  # 5개 (PB1, PC0, PC1, PA4, PA5)
 
-            for i in range(7):
-                parsed[i] = adc_raw[i + 1]
+                sw0 = unpacked[24]
+                sw1 = unpacked[25]
+                key_states_raw = unpacked[26]  # [신규 추가] 1바이트 키 상태
+                crc_recv = unpacked[27]  # [인덱스 수정] 기존 26에서 27로 한 칸 밀림
 
-            for i in range(7):
-                parsed[i + 7] = adc_raw[i + 9]
+                crc_calc = calc_crc16_ccitt(packet_bytes[:-2])
 
-            parsed[14] = adc_raw[16]
-            parsed[15] = adc_raw[17]
+                if crc_calc != crc_recv:
+                    print(
+                        f">>> [CRC 불일치] seq={seq_num} calc=0x{crc_calc:04X} recv=0x{crc_recv:04X}"
+                    )
+                    continue
 
-            sw_toggle = adc_raw[20]
+                key1_pressed = not bool(key_states_raw & (1 << 0))
+                key2_pressed = not bool(key_states_raw & (1 << 1))
+                key3_pressed = not bool(key_states_raw & (1 << 2))
+                key4_pressed = not bool(key_states_raw & (1 << 3))
+                key5_pressed = not bool(key_states_raw & (1 << 4))
 
-            last_serial_rx_time = time.time()
+                seq_result = seq_validator_adc.check(seq_num)
+                if seq_result != "OK":
+                    print(f">>> [SEQ {seq_result}] seq={seq_num}")
+
+                # ===== 채널 매핑 (확인된 값 기준) =====
+                for i in range(7):
+                    parsed[i] = mux_adc[i + 1]  # 왼팔: mux_adc[1]~[7]
+                for i in range(7):
+                    parsed[i + 7] = mux_adc[i + 9]  # 오른팔: mux_adc[9]~[15]
+
+                parsed[14] = adc_ind[3]  # PA4 (VRx)
+                parsed[15] = adc_ind[2]  # PC1 (VRy)
+                parsed[16] = adc_ind[4]  # PA5 (상하이동)  ← 새로 추가
+
+                sw_toggle = sw0
+                sw1_toggle_val = sw1
+
+                last_serial_rx_time = time.time()
 
         except Exception as e:
             print("ERR:", e)
@@ -387,7 +463,6 @@ def process_left_arm():
                     in_dead_zone_left[i] = True
                     continue
 
-        # [서보 write 없음 — 테스트 전용]
         prev_ticks_left[i] = tick
 
 
@@ -457,7 +532,6 @@ def process_right_arm():
             elif delta < -MAX_DELTA_RIGHT:
                 tick = prev_ticks_right[i] - MAX_DELTA_RIGHT
 
-            # [테스트 파일에서 추가] 오른팔 가속도 제한 (원본에서 누락돼 있던 부분)
             actual_delta = tick - prev_ticks_right[i]
             accel = actual_delta - prev_delta_right[i]
             if accel > MAX_ACCEL_RIGHT:
@@ -485,7 +559,6 @@ def process_right_arm():
                     in_dead_zone_right[i] = True
                     continue
 
-        # [서보 write 없음 — 테스트 전용]
         prev_ticks_right[i] = tick
 
 
@@ -496,7 +569,9 @@ t.start()
 crc16_self_test()
 sequence_validator_self_test()
 
-print("시작 (서보 없음 — Stage1/2 + 가속도 제한 + 통신 타임아웃 전용 테스트)")
+print(
+    "시작 (서보 없음 — Stage1/2 + 가속도 제한 + 통신 타임아웃 + 상하이동 판정 테스트)"
+)
 
 try:
     while True:
@@ -537,12 +612,18 @@ try:
         process_left_arm()
         process_right_arm()
 
+        lift_state = update_lift_state(parsed[16])  # ← 추가
+
         left_raw_str = " ".join([f"{parsed[i]:5d}" for i in range(7)])
         right_raw_str = " ".join([f"{parsed[i+7]:5d}" for i in range(7)])
 
         print(
             f"L:{left_raw_str} | R:{right_raw_str}"
             + f" SW:{sw_toggle}"
+            + f" SW1:{sw1_toggle_val}"
+            + f" LIFT:{lift_state:+d}(raw:{parsed[16]:4d})"
+            + f" KEYS:[{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}]"
+            + f" LJOY: PA4={parsed[14]:4d} PC1={parsed[15]:4d}"
             + f" L_STATE:{current_state_left}(prev:{prev_state_left}, cnt:{anomaly_count_left})"
             + f" R_STATE:{current_state_right}(prev:{prev_state_right}, cnt:{anomaly_count_right})"
         )
@@ -553,6 +634,6 @@ except KeyboardInterrupt:
     pass
 
 running = False
-time.sleep(0.1)  # [추가] ADC 스레드가 루프를 빠져나올 시간 확보
+time.sleep(0.1)
 
 print("종료")

@@ -1,72 +1,98 @@
 import serial
+import struct
 import time
-
-# =====================================================
-# 모터를 전혀 건드리지 않습니다. 안전합니다.
-# 서보 전원 빼놓고 돌려도 됩니다.
-#
-# 가변저항을 하나씩 돌려보면서
-# 어떤 숫자가 바뀌는지 확인하세요
-# =====================================================
 
 PORT_ADC = "COM13"
 BAUD_ADC = 115200
 
-try:
-    ser = serial.Serial(PORT_ADC, BAUD_ADC, timeout=1)
-    print("포트 열기 성공!")
-except Exception as e:
-    print(f"포트 열기 실패: {e}")
-    quit()
+PACKET_FORMAT = "<2sBH16H4HBBH"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 
-adc_raw = [0] * 19
-parsed = [0] * 16
-sw_toggle = 0
 
-print("")
-print("=" * 70)
-print(" 가변저항을 하나씩 돌려보면서 어떤 숫자가 바뀌는지 확인하세요")
-print(" 서보 전원은 빼놓으세요!")
-print(" Ctrl+C로 종료")
-print("=" * 70)
-print("")
-print(" p0    p1    p2    p3    p4    p5    p6  | p7    p8    p9   p10   p11   p12   p13 | Pan   Tilt  SW")
-print(" ----전반부(parsed 0~6)----              | ----모터용(parsed 7~13)----              | --조이스틱--")
-print("-" * 100)
+def calc_crc16_ccitt(data, initial=0xFFFF):
+    crc = initial
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = (
+                ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+            )
+    return crc
+
+
+ser = serial.Serial(PORT_ADC, BAUD_ADC, timeout=1)
+buf = bytearray()
+
+packet_count = 0
+crc_fail_count = 0
+garbage_byte_count = 0
+last_report = time.time()
+
+prev_mux = None
+change_count = [0] * 16
+
+print("실행 중 — 관절을 하나씩 움직이면서 어떤 인덱스가 반응하는지 확인하세요.")
+print("Ctrl+C로 종료")
 
 try:
     while True:
-        line = ser.readline().decode(errors='ignore').replace('\x00', '').strip()
-
-        if not line:
+        data = ser.read(ser.in_waiting or 1)
+        if not data:
             continue
+        buf.extend(data)
 
-        parts = line.split(",")
+        while len(buf) >= PACKET_SIZE:
+            idx = buf.find(b"\xaa\x55")
+            if idx == -1:
+                garbage_byte_count += len(buf)
+                buf.clear()
+                break
+            if idx > 0:
+                garbage_byte_count += idx
+                del buf[:idx]
+            if len(buf) < PACKET_SIZE:
+                break
 
-        if len(parts) < 19:
-            continue
+            packet_bytes = bytes(buf[:PACKET_SIZE])
+            del buf[:PACKET_SIZE]
 
-        for i in range(min(19, len(parts))):
-            val_str = ''.join(filter(str.isdigit, parts[i]))
-            if val_str != "":
-                adc_raw[i] = int(val_str)
+            unpacked = struct.unpack(PACKET_FORMAT, packet_bytes)
+            seq_num = unpacked[2]
+            mux_adc = unpacked[3:19]
+            adc_ind = unpacked[19:23]
+            sw0, sw1 = unpacked[23], unpacked[24]
+            crc_recv = unpacked[25]
 
-        for i in range(7):
-            parsed[i] = adc_raw[i + 1]
-        for i in range(7):
-            parsed[i + 7] = adc_raw[i + 9]
+            crc_calc = calc_crc16_ccitt(packet_bytes[:-2])
+            if crc_calc != crc_recv:
+                crc_fail_count += 1
+                continue
 
-        parsed[14] = adc_raw[16]
-        parsed[15] = adc_raw[17]
-        sw_toggle = adc_raw[18]
+            packet_count += 1
 
-        front = " ".join([f"{parsed[i]:5d}" for i in range(7)])
-        motor = " ".join([f"{parsed[i+7]:5d}" for i in range(7)])
+            if prev_mux is not None:
+                for i in range(16):
+                    if mux_adc[i] != prev_mux[i]:
+                        change_count[i] += 1
+            prev_mux = mux_adc
 
-        print(f"\033[F{front} | {motor} | {parsed[14]:5d} {parsed[15]:5d} {sw_toggle:3d}")
+            if time.time() - last_report > 1.0:
+                elapsed = time.time() - last_report
+                rate = packet_count / elapsed if elapsed > 0 else 0
+                print(
+                    f"--- {rate:.1f} pkt/s | CRC실패:{crc_fail_count} | 쓰레기바이트:{garbage_byte_count} ---"
+                )
+                print(f"mux_adc(원본, 왼팔=[1~7], 오른팔=[9~15]): {list(mux_adc)}")
+                print(f"adc_ind: {list(adc_ind)}  sw0:{sw0} sw1:{sw1}  seq:{seq_num}")
+                print(f"채널별 변화감지횟수(지난 1초): {change_count}")
+                packet_count = 0
+                crc_fail_count = 0
+                garbage_byte_count = 0
+                change_count = [0] * 16
+                last_report = time.time()
 
 except KeyboardInterrupt:
     pass
 
 ser.close()
-print("\n종료")
+print("종료")

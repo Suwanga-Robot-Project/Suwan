@@ -4,6 +4,7 @@ import threading
 import time
 import struct  # CRC
 import socket  # [추가] UDP 통신용
+import jog_control as jc
 from scservo_sdk import *
 from pantilt_safe2 import update_pantilt
 from pantilt_safe2 import scs_write_pos
@@ -13,6 +14,7 @@ from pantilt_safe2 import tilt_pos
 # PC에서 라파 없이 알고리즘만 테스트할 때
 from whells_safeN import update_wheels
 from adc_filter import AdcFilter
+from jog_control import JogController
 
 adc_filter = AdcFilter()
 # =====================================================
@@ -138,6 +140,17 @@ key2_pressed = False
 key3_pressed = False
 key4_pressed = False
 key5_pressed = False
+
+key7_pressed = False
+
+jog_left = JogController("L")
+jog_right = JogController("R")
+jog_off_L = [0] * 7
+jog_off_R = [0] * 7
+jog_written_left = [None] * 7  # 조그로 실제 보낸 마지막 목표값
+jog_written_right = [None] * 7
+last_jog_time = time.time()
+
 
 seq_checker = SequenceValidator()
 
@@ -297,6 +310,8 @@ def read_serial_adc():
     global adc_raw, parsed, sw_toggle, sw1_toggle, running, last_serial_rx_time
     global key1_pressed, key2_pressed, key3_pressed, key4_pressed, key5_pressed
     global first_packet_received  # ← 추가
+    global key7_pressed
+
     try:
         ser = serial.Serial(PORT_ADC, BAUD_ADC, timeout=1)
     except Exception as e:
@@ -418,6 +433,7 @@ def read_serial_adc():
                 key3_pressed = not bool(key_states_raw & (1 << 2))
                 key4_pressed = not bool(key_states_raw & (1 << 3))
                 key5_pressed = not bool(key_states_raw & (1 << 4))
+                key7_pressed = not bool(key_states_raw & (1 << 6))
 
                 first_packet_received = True  # ← 추가
                 last_serial_rx_time = time.time()
@@ -524,6 +540,7 @@ def disable_left_torque():
         packetHandler_left.write1ByteTxRx(
             portHandler_left, m, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
         )
+    jog_left.force_reset("에러")  # [조그] 추가
     print(">>> ERROR: 왼팔 전 모터 토크 OFF 완료")
 
 
@@ -625,13 +642,12 @@ def process_left_arm(portHandler, packetHandler):
                 else:
                     ema_values_left[i] = float(tick)
 
-            if prev_ticks_left[i] is not None:
-                dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
-                    i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
-                )
-                diff = abs(tick - prev_ticks_left[i])
-                if in_dead_zone_left[i]:
-                    diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
+            dz_enter, dz_exit = DEAD_ZONE_OVERRIDE_LEFT.get(
+                i, (DEAD_ZONE_ENTER_LEFT, DEAD_ZONE_EXIT_LEFT)
+            )
+            diff = abs(tick - prev_ticks_left[i])
+            if in_dead_zone_left[i]:
+                diff_from_anchor = abs(tick - dead_zone_anchor_left[i])
                 if diff_from_anchor <= dz_exit:
                     continue
                 else:
@@ -639,13 +655,24 @@ def process_left_arm(portHandler, packetHandler):
             else:
                 if diff <= dz_enter:
                     in_dead_zone_left[i] = True
-                    dead_zone_anchor_left[i] = (
-                        tick  # [추가] 이 순간 위치를 기준점으로 고정
-                    )
+                    dead_zone_anchor_left[i] = tick
                     continue
 
-        packetHandler.write2ByteTxRx(portHandler, m, ADDR_GOAL_POSITION, tick)
-        prev_ticks_left[i] = tick
+        packetHandler.write2ByteTxRx(
+            portHandler, m, ADDR_GOAL_POSITION, tick + jog_off_L[i]
+        )
+        prev_ticks_left[i] = tick  # ← 오프셋 없는 값 유지
+        jog_written_left[i] = tick + jog_off_L[i]
+        # ===== [조그] 데드존으로 건너뛴 채널 보정 =====
+    for i in (jc.IDX_UD, jc.IDX_LR):
+        if prev_ticks_left[i] is None:
+            continue
+        goal = prev_ticks_left[i] + jog_off_L[i]
+        if goal != jog_written_left[i]:
+            packetHandler.write2ByteTxRx(
+                portHandler, MOTORS_LEFT[i], ADDR_GOAL_POSITION, goal
+            )
+            jog_written_left[i] = goal
 
 
 # =========================
@@ -656,6 +683,7 @@ def disable_right_torque():
         packetHandler_right.write1ByteTxRx(
             portHandler_right, m, ADDR_TORQUE_ENABLE, TORQUE_DISABLE
         )
+    jog_right.force_reset("에러")
     print(">>> ERROR: 오른팔 전 모터 토크 OFF 완료")
 
 
@@ -753,7 +781,6 @@ def process_right_arm(portHandler, packetHandler):
 
             diff = abs(tick - prev_ticks_right[i])
             if in_dead_zone_right[i]:
-                # [수정] 직전 프레임이 아니라 "고정된 기준점"과의 차이로 판정
                 diff_from_anchor = abs(tick - dead_zone_anchor_right[i])
                 if diff_from_anchor <= DEAD_ZONE_EXIT_RIGHT:
                     continue
@@ -762,13 +789,24 @@ def process_right_arm(portHandler, packetHandler):
             else:
                 if diff <= DEAD_ZONE_ENTER_RIGHT:
                     in_dead_zone_right[i] = True
-                    dead_zone_anchor_right[i] = (
-                        tick  # [추가] 이 순간 위치를 기준점으로 고정
-                    )
+                    dead_zone_anchor_right[i] = tick
                     continue
 
-        packetHandler.write2ByteTxRx(portHandler, m, ADDR_GOAL_POSITION, tick)
+        goal = tick + jog_off_R[i]
+        packetHandler.write2ByteTxRx(portHandler, m, ADDR_GOAL_POSITION, goal)
         prev_ticks_right[i] = tick
+        jog_written_right[i] = goal
+
+    # ===== [조그] 데드존으로 건너뛴 채널 보정 =====
+    for i in (jc.IDX_UD, jc.IDX_LR):
+        if prev_ticks_right[i] is None:
+            continue
+        goal = prev_ticks_right[i] + jog_off_R[i]
+        if goal != jog_written_right[i]:
+            packetHandler.write2ByteTxRx(
+                portHandler, MOTORS_RIGHT[i], ADDR_GOAL_POSITION, goal
+            )
+            jog_written_right[i] = goal
 
 
 # =========================
@@ -949,6 +987,46 @@ try:
                 )
             current_state_left = STATE_ERROR
             current_state_right = STATE_ERROR
+        # ===== 조그 오프셋 계산 =====
+        _now = time.time()
+        dt = _now - last_jog_time
+        last_jog_time = _now
+
+        jog_off_L = jog_left.update(
+            gate_toggle=sw1_toggle,
+            key7=key7_pressed,
+            joy_x=parsed[17],
+            joy_y=parsed[18],
+            gripper_closed=(
+                prev_ticks_left[6] is not None
+                and prev_ticks_left[6] < GRIPPER_POS_OPEN_LEFT - 300
+            ),
+            dt=dt,
+        )
+        jog_off_R = jog_right.update(
+            gate_toggle=sw_toggle,
+            key7=key7_pressed,
+            joy_x=parsed[14],
+            joy_y=parsed[15],
+            gripper_closed=(
+                prev_ticks_right[6] is not None
+                and prev_ticks_right[6] < GRIPPER_POS_OPEN_RIGHT - 300
+            ),
+            dt=dt,
+        )
+
+        if (
+            prev_ticks_left[6] is not None
+            and prev_ticks_left[6] > GRIPPER_POS_OPEN_LEFT - 100
+        ):
+            if not jog_left.is_offset_zero():
+                jog_left.force_reset("그리퍼 개방")
+        if (
+            prev_ticks_right[6] is not None
+            and prev_ticks_right[6] > GRIPPER_POS_OPEN_RIGHT - 100
+        ):
+            if not jog_right.is_offset_zero():
+                jog_right.force_reset("그리퍼 개방")
 
         # =========================
         # 왼팔 / 오른팔 각각 독립 처리
@@ -968,7 +1046,7 @@ try:
         # =========================
         # 출력
         # =========================
-        print("\033[F", end="")
+        print("\033[11F", end="")
 
         left_raw_str = " ".join([f"{parsed[i]:5d}" for i in range(7)])
         right_raw_str = " ".join([f"{parsed[i+7]:5d}" for i in range(7)])
@@ -982,7 +1060,9 @@ try:
             f"[팬틸트] SW:{sw_toggle}  PAN:{pantilt_safe2.pan_pos:4d}  TILT:{pantilt_safe2.tilt_pos:4d}\n"
             f"[상하이동] LIFT:{lift_state:+d} (raw:{parsed[16]:4d})\n"
             f"[바퀴조이스틱] SW1:{sw1_toggle}  ind2:{parsed[17]:4d}  ind3:{parsed[18]:4d}\n"
-            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}]\n"
+            f"[키캡] [{int(key1_pressed)}{int(key2_pressed)}{int(key3_pressed)}{int(key4_pressed)}{int(key5_pressed)}] K7:{int(key7_pressed)}\n"
+            f"[조그] L:{jog_left.status_text()}\n"
+            f"       R:{jog_right.status_text()}\n"
             f"----------------------------------------------"
         )
 
@@ -1019,6 +1099,10 @@ running = False
 # =========================
 NEUTRAL_TICKS_LEFT = [1003, 1112, 2142, 976, 1858, 1939, 2034]  # 모터 1~7
 NEUTRAL_TICKS_RIGHT = [2983, 1044, 2020, 1017, 2102, 2088, 1966]  # 모터 9~15
+
+# [조그] 오프셋을 지운 뒤 중립 자세로 보낸다
+jog_left.force_reset("종료")
+jog_right.force_reset("종료")
 
 for i, m in enumerate(MOTORS_LEFT):
     target = NEUTRAL_TICKS_LEFT[i]

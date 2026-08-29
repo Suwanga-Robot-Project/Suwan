@@ -12,7 +12,7 @@ tool_changer_fsm.py는 이 파일이 있으면 자동으로 이걸 우선 사용
 
 import socket
 
-PI_HOST = "10.155.84.89"  # ⚠️ 실제 라즈베리파이 IP로 확인/수정 필요
+PI_HOST = "192.168.1.104"  # ⚠️ 실제 라즈베리파이 IP로 확인/수정 필요
 PI_PORT = 5006
 SOCKET_TIMEOUT = 15  # 초 — 하강이 오래 걸릴 수 있어 넉넉하게
 CONNECT_CHECK_TIMEOUT = 1.5  # 초 — import 시점 빠른 연결 확인용 (짧게)

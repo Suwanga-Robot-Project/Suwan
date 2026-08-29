@@ -1,4 +1,3 @@
-import pantilt_safe2
 import serial
 import threading
 import time
@@ -372,7 +371,7 @@ def read_serial_adc():
 MOTORS_LEFT = [1, 2, 3, 4, 5, 6, 7]
 REVERSE_CHANNELS_LEFT = [5]
 
-EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.7]
+EMA_ALPHA_ARM_LEFT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.7]
 EMA_ALPHA_GRIPPER_LEFT = 0.5
 
 DEAD_ZONE_ENTER_LEFT = 28
@@ -407,7 +406,7 @@ REVERSE_CHANNELS_RIGHT = [0, 3, 4, 5, 6]
 PAN_ID = 22
 TILT_ID = 33
 
-EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.35, 0.3, 0.4, 0.7]
+EMA_ALPHA_ARM_RIGHT = [0.35, 0.35, 0.3, 0.3, 0.3, 0.7]
 EMA_ALPHA_GRIPPER_RIGHT = 0.5
 
 DEAD_ZONE_ENTER_RIGHT = 28

@@ -14,12 +14,12 @@ NEUTRAL_TICKS_LEFT = [1003, 1112, 2142, 976, 1858, 1939, 2034]
 NEUTRAL_TICKS_RIGHT = [2983, 1044, 2020, 1017, 2102, 2088, 1966]
 
 # ===== 왼팔 스테이션 (실측완료) =====
-DEFAULT_TICKS_LEFT = [1406, 1400, 1855, 1790, 245, 1722, 0]
-VISE_TICKS_LEFT = [1234, 1348, 1850, 1735, 258, 1774, 0]
+DEFAULT_TICKS_LEFT = [1396, 1400, 1855, 1790, 203, 1722, 0]
+VISE_TICKS_LEFT = [1214, 1348, 1850, 1735, 208, 1774, 0]
 
 # ===== 오른팔 스테이션 (실측완료) =====
 FINE_TICKS_RIGHT = [2396, 1195, 2707, 1607, 3446, 1757, 0]
-NIPPER_TICKS_RIGHT = [2536, 1204, 2686, 1763, 3450, 1654, 0]
+NIPPER_TICKS_RIGHT = [2566, 1104, 2686, 1763, 3450, 1654, 0]
 
 # =====================================================================
 # ===== 그리퍼별 최대 개방/조임 값 (탈거·부착 시 사용, 실측완료) =====
@@ -31,24 +31,24 @@ NIPPER_TICKS_RIGHT = [2536, 1204, 2686, 1763, 3450, 1654, 0]
 #    이름을 기준으로 이름 붙임 (LEFT/RIGHT 혼동 방지)
 
 # ===== 1번: 오른팔 미세그리퍼 =====
-FINE_MAX_OPEN_RIGHT = 0  # 미세 그리퍼: 최대로 펼 때
-FINE_MAX_CLOSE_RIGHT = 4095  # 미세 그리퍼: 최대로 조일 때
+FINE_MAX_OPEN_RIGHT = 906  # 미세: 최대 개방 (gripper_dir_check 실측)
+FINE_MAX_CLOSE_RIGHT = 4000  # 미세: 최대 조임 (허공 기준 — 아래 주의 참고)
 
 # ===== 2번: 오른팔 니퍼그리퍼 =====
-NIPPER_MAX_OPEN_RIGHT = 1898  # 니퍼: 최대로 펼 때
-NIPPER_MAX_CLOSE_RIGHT = 3393  # 니퍼: 최대로 조일 때
+NIPPER_MAX_OPEN_RIGHT = 1208  # 니퍼: 최대 개방 (실측)
+NIPPER_MAX_CLOSE_RIGHT = 4000  # 니퍼: 최대 조임 (실측)
 
 # ===== 3번: 왼팔 기본그리퍼 =====
-DEFAULT_MAX_OPEN_LEFT = 0  # 기본 그리퍼: 최대로 펼 때
-DEFAULT_MAX_CLOSE_LEFT = 4095  # 기본 그리퍼: 최대로 조일 때
+DEFAULT_MAX_OPEN_LEFT = 700  # 기본: 최대 개방 (실측)
+DEFAULT_MAX_CLOSE_LEFT = 4200  # 기본: 최대 조임 (실측)
 
 # ===== 4번: 왼팔 바이스그리퍼 =====
-VISE_MAX_OPEN_LEFT = 0  # 바이스 그리퍼: 최대로 펼 때
-VISE_MAX_CLOSE_LEFT = 4095  # 바이스 그리퍼: 최대로 조일 때
+VISE_MAX_OPEN_LEFT = 1404  # 바이스: 최대 개방 (실측)
+VISE_MAX_CLOSE_LEFT = 4300  # 바이스: 최대 조임 (실측)
 
-# ===== 니퍼 안전범위 =====
-# 니퍼는 다른 그리퍼보다 이동거리 한계가 짧아서 보호 필요
-NIPPER_SAFE_TICK_RANGE = (1718, 3593)  # (MIN, MAX)
+# ===== (폐기) 구 니퍼 안전범위 =====
+# 값이 니퍼 실제 가동범위(약 2048~3268)보다 넓어 아무것도 막지 못했음.
+# 그리퍼 안전범위는 아래 GRIPPER_SAFE_RANGE 로 이관됨.
 
 # =====================================================================
 # ===== 반대편 팔 안전 대기자세 (충돌 방지용) =====
@@ -59,7 +59,7 @@ NIPPER_SAFE_TICK_RANGE = (1718, 3593)  # (MIN, MAX)
 # 스왑이 끝나면 원래 있던 자리로 복귀시킴.
 
 SAFE_RETREAT_MOTOR1_LEFT = 1749  # 왼팔 안전자세 1번 모터 tick
-SAFE_RETREAT_MOTOR1_RIGHT = 2453  # 오른팔 안전자세 1번 모터 tick
+SAFE_RETREAT_MOTOR1_RIGHT = 2593  # 오른팔 안전자세 1번 모터 tick
 
 
 def get_safe_retreat_ticks(arm_side):
@@ -76,6 +76,136 @@ def get_safe_retreat_ticks(arm_side):
     ticks = list(neutral)
     ticks[0] = motor1_override
     return ticks
+
+
+# =====================================================================
+# ===== 관절별 소프트 리밋 (가동범위 제한) =====
+# =====================================================================
+# 지금까지 tick 제한은 그리퍼(7번)의 NIPPER_SAFE_TICK_RANGE 하나뿐이었고,
+# 1~6번 관절에는 가동범위 제한이 전혀 없었다. 마스터암 튐이나 조그 오프셋이
+# 얹히면 관절이 기구 한계까지 그대로 밀고 들어가 서보가 과부하로 멈춘다.
+#
+# 형식: [ (min, max) 또는 None, ... ] — 모터 1~7 순서, 총 7개
+#   None = 아직 미실측 → clamp 건너뜀 (지금 넣어도 동작이 바뀌지 않음)
+#
+# ⚠️ 측정값 그대로 넣지 말 것. joint_range_probe.py가 실측 한계에서
+#    SAFETY_MARGIN(기본 60tick)만큼 안쪽으로 좁힌 값을 출력해준다.
+#    한계에 딱 맞추면 백래시 때문에 결국 부딪힌다.
+#
+# ⚠️ 7번(그리퍼)은 여기 두지 말고 None으로 남길 것.
+#    그리퍼는 MAX_OPEN/MAX_CLOSE와 clamp_for_nipper()가 따로 관리한다.
+
+JOINT_LIMITS_LEFT = [
+    (850, 2422),  # 1번 — 실측 850~1298, 동작자세 1003~2362 반영해 확장
+    (956, 2043),  # 2번 — 실측 956~1299, 동작자세 1036~1983 반영해 확장
+    (1013, 3278),  # 3번 — 실측 그대로
+    (901, 2304),  # 4번 — 실측 901~1694, 동작자세 976~2244 반영해 확장
+    (8, 3733),  # 5번 — 실측 그대로
+    (968, 3015),  # 6번 — 실측 그대로
+    None,  # 7번 그리퍼 — GRIPPER_SAFE_RANGE 로 별도 관리
+]
+
+JOINT_LIMITS_RIGHT = [
+    (1452, 3653),  # 1번 — 실측 2734~3174, 동작자세 1512~3593 반영해 확장
+    (868, 1830),  # 2번 — 실측 869~1830, 동작자세 928~1736 반영해 확장
+    (760, 3664),  # 3번 — 실측 그대로
+    (857, 2155),  # 4번 — 실측 857~1244, 동작자세 1017~2095 반영해 확장
+    (15, 4000),  # 5번 — 실측 그대로
+    (1149, 3005),  # 6번 — 실측 그대로
+    None,  # 7번 그리퍼 — GRIPPER_SAFE_RANGE 로 별도 관리
+]
+
+# 서보 물리 한계 (소프트 리밋이 없는 축에도 최소한 이건 적용)
+SERVO_TICK_MIN = 0
+SERVO_TICK_MAX = 4095
+
+
+def get_joint_limits(arm_side):
+    """팔별 소프트 리밋 리스트 반환."""
+    return JOINT_LIMITS_LEFT if arm_side == "left" else JOINT_LIMITS_RIGHT
+
+
+def clamp_joint(arm_side, index, tick):
+    """
+    한 관절의 tick을 소프트 리밋 안으로 제한.
+    해당 축이 미실측(None)이면 서보 물리 범위(0~4095)만 적용한다.
+    """
+    if tick is None:
+        return None
+
+    tick = int(tick)
+    limits = get_joint_limits(arm_side)
+
+    if 0 <= index < len(limits) and limits[index] is not None:
+        lo, hi = limits[index]
+        if lo is not None:
+            tick = max(lo, tick)
+        if hi is not None:
+            tick = min(hi, tick)
+
+    return max(SERVO_TICK_MIN, min(SERVO_TICK_MAX, tick))
+
+
+def clamp_arm_ticks(arm_side, ticks):
+    """
+    팔 전체 tick 리스트에 소프트 리밋 적용.
+    None 원소는 그대로 None으로 통과시킨다(호출부에서 판단).
+    """
+    return [clamp_joint(arm_side, i, t) for i, t in enumerate(ticks)]
+
+
+# =====================================================================
+# ===== 그리퍼별 안전범위 (조종 중 과조임/과개방 방지) =====
+# =====================================================================
+# gripper_dir_check.py 실측 끝단에서 GRIPPER_MARGIN만큼 안쪽으로 좁힌 값.
+# None = 미실측 → 서보 물리범위(0~4095)만 적용, 즉 실질적으로 제한 없음.
+#
+# ⚠️ 반드시 MAX_OPEN/MAX_CLOSE 사이에 들어와야 한다.
+#    안전범위가 실제 가동범위보다 넓으면 아무것도 막지 못한다
+#    (기존 NIPPER_SAFE_TICK_RANGE=(1718,3593)이 정확히 그 상태였음).
+#
+# ⚠️ 이 clamp는 "라이브 조종" 경로에만 걸린다. 그리퍼 교체 시퀀스의
+#    탈거/부착은 MAX_OPEN/MAX_CLOSE를 직접 쓰므로, 그쪽은 아래
+#    MAX_OPEN/MAX_CLOSE 값 자체가 정확해야 안전하다.
+
+GRIPPER_MARGIN = 30  # 실측 끝단에서 안쪽으로 좁힐 tick
+
+GRIPPER_SAFE_RANGE = {
+    ("left", "default"): (1202, 4200),  # 실측 1172~3769
+    ("left", "vise"): (1434, 4300),  # 실측 1404~4001
+    ("right", "fine"): (706, 4000),  # 실측  906~3506
+    ("right", "nipper"): (1238, 4000),  # 실측 1208~3083
+}
+
+
+def clamp_gripper(arm_side, gripper_name, tick):
+    """
+    그리퍼(7번 모터) tick을 그 그리퍼의 안전범위로 제한.
+    빈손(gripper_name=None)이거나 미실측이면 서보 물리범위만 적용한다.
+    어떤 경우에도 예외를 던지지 않는다 — 그리퍼가 잠기는 일은 없어야 한다.
+    """
+    if tick is None:
+        return None
+
+    tick = int(tick)
+    rng = GRIPPER_SAFE_RANGE.get((arm_side, gripper_name)) if gripper_name else None
+
+    if rng is not None:
+        lo, hi = rng
+        if lo is not None:
+            tick = max(lo, tick)
+        if hi is not None:
+            tick = min(hi, tick)
+
+    return max(SERVO_TICK_MIN, min(SERVO_TICK_MAX, tick))
+
+
+def clamp_for_nipper(gripper_tick):
+    """
+    (구버전 호환) 니퍼 전용 clamp.
+    새 코드에서는 clamp_gripper('right', 'nipper', tick)를 쓸 것.
+    """
+    return clamp_gripper("right", "nipper", gripper_tick)
 
 
 # =====================================================================
@@ -144,7 +274,7 @@ DIRECT_SWAP_CLEARANCE_LEFT = {
         # 2) 1번 모터만
         ([2362, 1036, 1164, 1974, 1044, 1953], 0.0),
         # 3) 2번 모터만
-        ([1512, 1983, 3027, 1844, 3042, 1886], 0.0),
+        ([2362, 1983, 1164, 1974, 1044, 1953], 0.0),
         # 4) 전 축 동시 이동
         ([2015, 1373, 1281, 2244, 705, 1950], 0.0),
         # 5) 목표(니퍼) 스테이션 A값 → 자동으로 붙음
@@ -159,7 +289,7 @@ DIRECT_SWAP_CLEARANCE_LEFT = {
         # 3) 2번 모터만
         ([2228, 1895, 1182, 1948, 1035, 2069], 0.0),
         # 4) 전 축 동시 이동
-        ([1789, 1088, 1168, 2054, 1045, 2016], 0.0),
+        ([1889, 1088, 1168, 2054, 1045, 2016], 0.0),
         # 5) 목표(니퍼) 스테이션 A값 → 자동으로 붙음
     ],
 }
@@ -284,11 +414,3 @@ def get_gripper_max_close(arm_side, gripper_name):
         ("right", "nipper"): NIPPER_MAX_CLOSE_RIGHT,
     }
     return table.get((arm_side, gripper_name))
-
-
-def clamp_for_nipper(gripper_tick):
-    """니퍼 장착 시에만 그리퍼(7번 모터) tick을 안전범위로 제한."""
-    lo, hi = NIPPER_SAFE_TICK_RANGE
-    if lo is None or hi is None:
-        raise ValueError("NIPPER_SAFE_TICK_RANGE가 아직 실측되지 않았습니다")
-    return max(lo, min(hi, gripper_tick))

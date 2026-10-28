@@ -1,0 +1,3 @@
+# Goal tracker runtime and tests use the Python standard library only.
+# Add third-party dependencies with version constraints here when introduced.
+# Existing robot firmware/control dependencies are outside this file's scope.

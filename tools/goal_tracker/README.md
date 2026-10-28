@@ -1,6 +1,7 @@
 # 계획 대비 목표 관리
 
-Python 3의 표준 라이브러리만 사용합니다. 외부 설치는 필요 없습니다.
+Python 3.10 이상의 표준 라이브러리를 사용합니다. 외부 패키지는 필요 없습니다.
+환경 구성과 `requirement.txt` 사용법은 [저장소 README](../../README.md)를 참고하세요.
 
 ## 파일
 
@@ -14,14 +15,14 @@ Python 3의 표준 라이브러리만 사용합니다. 외부 설치는 필요 �
 
 ```sh
 python3 goal_tracker.py report
-python3 goal_tracker.py update G05 --status assessed --level 0 --result '최종 확인 결과 가스 센서는 미구현' --as-of 2026-10-28
+python3 goal_tracker.py update G05 --status assessed --level 0 --attainment not_met --result '최종 확인 결과 가스 센서는 미구현' --evidence '확인 자료 위치' --as-of 2026-10-29
 python3 goal_tracker.py report
 ```
 
 검증 완료 예시입니다. 실제 시험한 결과로 바꿔 사용하세요.
 
 ```sh
-python3 goal_tracker.py update G04 --status assessed --level 3 --acceptance '합의한 온도 오차 기준' --result '실제 시험 결과 입력' --evidence '시험 로그 경로 또는 문서·쪽수' --next-action '잔여 조치 입력' --as-of 2026-10-28
+python3 goal_tracker.py update G04 --status assessed --level 3 --attainment met --acceptance '합의한 온도 오차 기준' --result '실제 시험 결과 입력' --evidence '시험 로그 경로 또는 문서·쪽수' --next-action '잔여 조치 입력' --as-of 2026-10-29
 ```
 
 도움말: `python3 goal_tracker.py --help`, `python3 goal_tracker.py update --help`
@@ -30,6 +31,21 @@ python3 goal_tracker.py update G04 --status assessed --level 3 --acceptance '합
 
 각 목표는 0(미구현 확인), 1(일부 구현·대체 동등성 미확인), 2(목표 범위 구현), 3(수용 기준 검증 완료)으로 평가합니다. 사실관계를 확인하지 못하면 `unconfirmed` 상태를 유지합니다.
 
+목표 충족 여부는 `attainment`로 별도 관리합니다: `met`(충족), `not_met`(미충족), `unconfirmed`(미확인).
+예를 들어 비용 목표를 초과했다면 개발 진척과 별개로 미충족을 기록합니다.
+충족 판정에는 단계 3이 필요하며, 단계 3은 미충족과 함께 지정할 수 없습니다.
+충족·미충족 판정 또는 단계 3에는 수용 기준·결과·증빙이 모두 필요합니다.
+단계 3만 입력해도 충족 판정이 자동으로 바뀌지는 않습니다. 충족 판정은 명시적으로 입력하세요.
+
+`status=unconfirmed`에서는 `level=0`, `attainment=unconfirmed`만 허용합니다.
+이때의 0은 미구현 확인을 의미하지 않는 자리값이며 점수에 반영하지 않습니다.
+평가를 확정하려면 `--status assessed`를 함께 지정하세요.
+
+목표별 평가일은 `evaluated_at`, 전체 기준일은 `as_of`입니다.
+목표 평가일 이전으로 되돌리는 수정은 거부하며 전체 기준일은 감소하지 않습니다.
+기존 파일에서 목표별 평가일이 없으면 수정 시 기존 전체 기준일을 하한으로 사용합니다.
+보고서에서는 누락된 평가일을 '미기록'으로 표시합니다.
+
 관리용 달성지수 = 확인된 항목의 `가중치 × 단계 / 3` 합계 ÷ 전체 가중치 × 100.
 
 미확인도 분모에는 포함합니다. 따라서 이 값은 확인 근거를 보수적으로 반영한 지표이며, 미확인이 곧 실패라는 뜻은 아닙니다. 평가 확인 범위와 미확인 항목의 가정상 상한을 함께 표시합니다.
@@ -37,6 +53,19 @@ python3 goal_tracker.py update G04 --status assessed --level 3 --acceptance '합
 초기 값은 문서 검토에 따른 잠정 판단입니다. 단계 간 동일 간격과 동일 가중치는 관리 편의를 위한 규칙이며 성능 달성 비율 자체를 뜻하지 않습니다. 항목 분할에 따라서도 결과가 달라지므로 공식 제출 수치로 사용하려면 목표 목록·가중치·수용 기준을 먼저 합의하세요. 특히 비용 목표는 초과 사실을 별도로 판단해야 하며 단계 점수만으로 달성을 선언하면 안 됩니다.
 
 가중치·목표명·추가 성과는 JSON에서 편집할 수 있습니다. 최초 목표를 삭제하거나 변경해 달성지수를 높이지 마세요. 변경 기준선이 승인되면 기존 데이터 사본을 보관하고 별도로 관리하세요. update 명령은 항목 수정 이력을 보관하지만 JSON 직접 편집은 자동 기록하지 않습니다. 동시 편집은 지원하지 않습니다.
+
+수정 이력에는 항목 수정 전후 값, 전체 기준일 전후 값, UTC 기록 시각을 저장합니다.
+입력 데이터와 동일한 파일을 출력 경로로 지정하면 차단합니다(심볼릭 링크·하드 링크 포함).
+데이터와 보고서는 고유 임시 파일에 작성한 뒤 교체합니다.
+`--data`로 별도 파일을 선택하면 기본 보고서도 그 파일과 같은 폴더에 생성합니다.
+
+## 회귀시험
+
+저장소 최상위 폴더에서 실행합니다. 모든 시험은 표준 라이브러리 `unittest`를 사용합니다.
+
+```sh
+python -m unittest discover -s tools/goal_tracker -p 'test_*.py' -v
+```
 
 증빙 입력란이 채워졌는지는 검사하지만, 증빙 내용이 참인지 또는 수용 기준을 충족하는지는 사람이 검토해야 합니다.
 

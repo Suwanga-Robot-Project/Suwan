@@ -11,7 +11,9 @@
       "acceptance": "양팔·주행·높이 조절을 통합하고 대표 작업 성공 기준을 합의",
       "result": "양팔·4WD·도르래 승강부 통합 기재",
       "evidence": "결과보고서 5~7쪽",
-      "next_action": "반복 작업 성공률·가반하중 측정"
+      "next_action": "반복 작업 성공률·가반하중 측정",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G02",
@@ -22,7 +24,9 @@
       "acceptance": "원래 IMU 기능 또는 동등한 대체 조작 성능 확인",
       "result": "가변저항 마스터암으로 변경, IMU 제외 사유 불명확",
       "evidence": "계획서 10~11쪽; 결과보고서 7·10쪽",
-      "next_action": "변경 사유와 추종 오차·지연 비교"
+      "next_action": "변경 사유와 추종 오차·지연 비교",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G03",
@@ -33,7 +37,9 @@
       "acceptance": "목표 작업별 성공 기준과 시험 조건 합의",
       "result": "교체형 그리퍼·니퍼 등으로 변경",
       "evidence": "계획서 12~13쪽; 결과보고서 4·9쪽",
-      "next_action": "다지 손 대체 범위 및 작업별 성공률 입증"
+      "next_action": "다지 손 대체 범위 및 작업별 성공률 입증",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G04",
@@ -44,7 +50,9 @@
       "acceptance": "온도 정확도·영상 정렬 오차 기준 합의 후 시험",
       "result": "RGB·MLX90640 매핑 및 HUD 구현 기재",
       "evidence": "결과보고서 6~7쪽",
-      "next_action": "기준 온도 비교와 화면 정렬 시험"
+      "next_action": "기준 온도 비교와 화면 정렬 시험",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G05",
@@ -55,7 +63,9 @@
       "acceptance": "계획한 가스 센서의 출력·경고 동작 확인",
       "result": "MQ-2 완료 여부 불명확",
       "evidence": "계획서 4·9쪽; 결과보고서에는 명확한 완료 근거 없음",
-      "next_action": "설치·코드·검교정 자료 확인 또는 제외 사유 기록"
+      "next_action": "설치·코드·검교정 자료 확인 또는 제외 사유 기록",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G06",
@@ -66,7 +76,9 @@
       "acceptance": "대상 객체·정확도·지연 기준 합의 후 시험",
       "result": "Gemini 요청형 분석은 기재되지만 YOLO 완료 근거 불명확",
       "evidence": "계획서 9~10쪽; 결과보고서 6쪽",
-      "next_action": "원래 기능 완료 여부 또는 대체 동등성 확인"
+      "next_action": "원래 기능 완료 여부 또는 대체 동등성 확인",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G07",
@@ -77,7 +89,9 @@
       "acceptance": "로봇 손과 대상 사이 거리 표시·오차 시험",
       "result": "구현 및 시험 결과 불명확",
       "evidence": "계획서 3·13쪽",
-      "next_action": "완료 증빙 또는 미구현·범위 변경 명시"
+      "next_action": "완료 증빙 또는 미구현·범위 변경 명시",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G08",
@@ -88,7 +102,9 @@
       "acceptance": "대상 사용자 교육 시간·오조작·과제 성공 기준 합의",
       "result": "OSD·가이드·음성 안내 기재, 고령자 사용성 시험 없음",
       "evidence": "결과보고서 4·6~7쪽",
-      "next_action": "고령 사용자 평가 또는 대체 평가의 한계 기록"
+      "next_action": "고령 사용자 평가 또는 대체 평가의 한계 기록",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G09",
@@ -99,7 +115,9 @@
       "acceptance": "입력 응답·동작 추종·통신 장애 정지 기준을 별도로 정의",
       "result": "평균 루프 20.95ms, CRC 686회 무오류; 응답 목표와 별개",
       "evidence": "계획서 10쪽; 결과보고서 9~10쪽",
-      "next_action": "종단 지연·오류 주입·비상정지 시험"
+      "next_action": "종단 지연·오류 주입·비상정지 시험",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G10",
@@ -110,7 +128,9 @@
       "acceptance": "동일한 비용 포함 범위로 총액 100만 원 이하",
       "result": "1,376,860원 기재, 세부 합계는 1,404,360원",
       "evidence": "계획서 14·17쪽; 결과보고서 8쪽",
-      "next_action": "합계 수정·원가 초과 사유·절감 가능 항목 정리"
+      "next_action": "합계 수정·원가 초과 사유·절감 가능 항목 정리",
+      "evaluated_at": "2026-10-28",
+      "attainment": "not_met"
     },
     {
       "id": "G11",
@@ -121,7 +141,9 @@
       "acceptance": "출원번호·출원일 등 증빙 확보",
       "result": "성과표에서 달성 기록 없음; 실제 출원 여부 미확인",
       "evidence": "계획서 13쪽; 결과보고서 11~12쪽",
-      "next_action": "출원 상태 확인 후 미달성 또는 완료 기록"
+      "next_action": "출원 상태 확인 후 미달성 또는 완료 기록",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G12",
@@ -132,7 +154,9 @@
       "acceptance": "현장 적용·운용 평가 등 실용화 판정 기준 합의",
       "result": "시제품 통합은 기재되지만 현장 적용 증빙 없음",
       "evidence": "계획서 14쪽; 결과보고서 12·16쪽",
-      "next_action": "시제품과 현장 실용화 단계 구분"
+      "next_action": "시제품과 현장 실용화 단계 구분",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     },
     {
       "id": "G13",
@@ -143,7 +167,9 @@
       "acceptance": "당초 지정한 교내 대회 출품 증빙 확인",
       "result": "전국ICT공모전 장려상 기재; 교내 대회 여부 불명확",
       "evidence": "계획서 13~14쪽; 결과보고서 12쪽",
-      "next_action": "교내 출품 또는 목표 대회 변경 근거 확인"
+      "next_action": "교내 출품 또는 목표 대회 변경 근거 확인",
+      "evaluated_at": "2026-10-28",
+      "attainment": "unconfirmed"
     }
   ],
   "additional_outcomes": [
